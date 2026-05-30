@@ -79,6 +79,15 @@ def get_latest(self) -> dict | None:
     "severity": "good|info|warning|blocking",
     "code": "ok|starting|searching|no_person|legs_out_of_frame|torso_out_of_frame|partial_body|not_side_view|low_visibility|camera_stale",
     "hint": "Tracking — go."
+  },
+  "profile": {
+    "patient_name": "Sam",
+    "condition": "post-ACL repair, left knee, 6 weeks",
+    "sets": 3, "reps_per_set": 8,
+    "depth_deg": 100.0, "tempo_sec": 3.0,
+    "focus": "controlled eccentric; quad re-engagement",
+    "contraindications": ["no valgus collapse"],
+    "source": "default|uploaded|parsed"
   }
 }
 ```
@@ -140,9 +149,18 @@ fallback string were added so the Gemini agent has PT-relevant data to ground it
       "occlusion_events": 2
     }
   },
-  "templated_debrief": "Completed 10 of 10 reps. Average depth 95° (70% at target)..."
+  "templated_debrief": "Completed 10 of 10 reps. Average depth 95° (70% at target)...",
+  "profile": { /* same shape as 4c profile */ },
+  "ai_debrief": null
 }
 ```
+
+`ai_debrief` is `null` on the initial `set_end` message. The Gemini call
+runs asynchronously and the result arrives as a separate WS message of
+type `ai_debrief` once available (typically 1–3s later). UI shows the
+`templated_debrief` immediately, then swaps to `ai_debrief` when it
+arrives — degrades gracefully if Gemini errors (UI keeps the templated
+text).
 
 `templated_debrief` is the rule-based fallback the UI shows verbatim if the Gemini call errors
 or times out (per reliability rule, section 8).
@@ -175,14 +193,16 @@ rich 4d summary + templated debrief; emits 4c per frame via `on_state(state)`.
 Exports `SquatTracker` (alias of `PoseTracker`), `run_camera(tracker, camera_index, side)`,
 and `MockIMU` for `main.py` to wire up. Tests in `smoke.py` (60 assertions).
 
-### Agent C — UI / dashboard + voice + Gemini + BigQuery (`server.py` + dashboard)
+### Agent C — UI / dashboard + voice + BigQuery (`server.py` + dashboard)
 FastAPI server with a WebSocket. `server.py` exposes:
 - `start_server()` — boots uvicorn in a background thread (non-blocking).
 - `broadcast_state(state: dict)` — pushes per-frame state to all WS clients.
-- `handle_set_end(summary: dict)` — calls Gemini (`gemini-2.5-flash`, key from `GEMINI_API_KEY`)
-  for the debrief, writes to BigQuery, then broadcasts a `{"type":"debrief", ...}` message to
-  the dashboard so the UI can show + speak it. Falls back to `summary.templated_debrief` if
-  Gemini errors.
+- `handle_set_end(summary: dict)` — writes to BigQuery, then re-broadcasts.
+  (The Gemini call moved to Agent B's `ai_agent.py` — UI just plays the
+  `ai_debrief` text via ElevenLabs when it arrives.)
+- Mounts a textarea + Submit on the dashboard for `POST /profile/upload`.
+- Wires Web Speech API voice commands per **`HANDOFF_VOICE_IN.md`**
+  ("Hey coach" wake word + 4 commands + push-to-talk fallback + buttons).
 
 Two dashboard views:
 - **(A) Patient Live View** — camera feed slot + big rep counter + depth gauge with parallel

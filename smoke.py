@@ -288,7 +288,13 @@ def t12_force_reset_to_up():
 
 def t13_summary_structure_and_trends():
     print("\n[13] Per-set summary shape: legacy fields + analysis + templated_debrief")
-    tracker = PoseTracker(show_window=False)
+    # Force the legacy thresholds (95°/1.5s) so the test's bot=105° trips the
+    # shallow flag regardless of which profile is the package default.
+    from profile import PTProfile
+    test_profile = PTProfile(
+        patient_name="Test", reps_per_set=6, depth_deg=95.0, tempo_sec=1.5,
+    )
+    tracker = PoseTracker(show_window=False, profile=test_profile)
     tracker._set_start_t = 0.0
     t = 0.0
     # 6 reps; the last 2 are shallow (bot=105) to trigger declining_late + shallow flag
@@ -419,6 +425,98 @@ def t17_setup_ok():
 
 
 # ---------------------------------------------------------------------------
+# Profile binding (the PT prescription overrides backend defaults).
+# ---------------------------------------------------------------------------
+def t18_profile_drives_thresholds():
+    print("\n[18] Profile drives target_depth_deg / rep_target on construction")
+    from profile import PTProfile
+    p = PTProfile(reps_per_set=8, depth_deg=110.0, tempo_sec=2.5)
+    tr = PoseTracker(show_window=False, profile=p)
+    check("rep_target == 8", tr.rep_target == 8, 8, tr.rep_target)
+    check("target_depth_deg == 110", tr.target_depth_deg == 110.0, 110.0, tr.target_depth_deg)
+    check("fast_rep_sec == 2.5", tr.fast_rep_sec == 2.5, 2.5, tr.fast_rep_sec)
+    check("parallel_deg == 115 (target+5)", tr.parallel_deg == 115.0, 115.0, tr.parallel_deg)
+
+
+def t19_depth_state_follows_profile():
+    print("\n[19] depth_state classification follows the profile's target")
+    from profile import PTProfile
+    # Generic-default tracker: 95° target. 98° is at_parallel (in [95, 100]).
+    tr_generic = PoseTracker(
+        show_window=False,
+        profile=PTProfile(reps_per_set=10, depth_deg=95.0, tempo_sec=1.5),
+    )
+    check("95° target: 98° -> at_parallel",
+          tr_generic._depth_state(98.0) == "at_parallel",
+          "at_parallel", tr_generic._depth_state(98.0))
+    check("95° target: 110° -> shallow",
+          tr_generic._depth_state(110.0) == "shallow",
+          "shallow", tr_generic._depth_state(110.0))
+    # Wider-prescription tracker: 120° target. 110° is now below_parallel.
+    tr_wide = PoseTracker(
+        show_window=False,
+        profile=PTProfile(reps_per_set=10, depth_deg=120.0, tempo_sec=1.5),
+    )
+    check("120° target: 110° -> below_parallel",
+          tr_wide._depth_state(110.0) == "below_parallel",
+          "below_parallel", tr_wide._depth_state(110.0))
+    check("120° target: 130° -> shallow",
+          tr_wide._depth_state(130.0) == "shallow",
+          "shallow", tr_wide._depth_state(130.0))
+
+
+def t20_set_profile_is_queued_until_reset():
+    print("\n[20] set_profile() is queued; doesn't change live thresholds mid-set")
+    from profile import PTProfile
+    tr = PoseTracker(
+        show_window=False,
+        profile=PTProfile(reps_per_set=10, depth_deg=95.0, tempo_sec=1.5),
+    )
+    check("initial target_depth_deg == 95", tr.target_depth_deg == 95.0, 95.0, tr.target_depth_deg)
+    tr.set_profile(PTProfile(reps_per_set=5, depth_deg=120.0, tempo_sec=3.0))
+    # Pending: live values UNCHANGED.
+    check("after set_profile, target unchanged", tr.target_depth_deg == 95.0, 95.0, tr.target_depth_deg)
+    check("after set_profile, rep_target unchanged", tr.rep_target == 10, 10, tr.rep_target)
+    # reset_set applies it.
+    tr.reset_set()
+    check("after reset_set, target swapped", tr.target_depth_deg == 120.0, 120.0, tr.target_depth_deg)
+    check("after reset_set, rep_target swapped", tr.rep_target == 5, 5, tr.rep_target)
+    check("after reset_set, profile updated", tr.profile.reps_per_set == 5, 5, tr.profile.reps_per_set)
+
+
+# ---------------------------------------------------------------------------
+# ai_agent fallback paths — both functions return None cleanly without a key.
+# ---------------------------------------------------------------------------
+def t21_ai_agent_no_key_is_silent():
+    print("\n[21] ai_agent: no GEMINI_API_KEY -> None, no exception")
+    import os
+    saved = os.environ.pop("GEMINI_API_KEY", None)
+    try:
+        import ai_agent
+        from profile import DEFAULT_PROFILE
+        r1 = ai_agent.parse_prescription("3x10 squats at 95 degrees")
+        r2 = ai_agent.generate_debrief(DEFAULT_PROFILE, {"reps_completed": 0})
+        check("parse_prescription -> None", r1 is None, None, r1)
+        check("generate_debrief -> None", r2 is None, None, r2)
+    finally:
+        if saved is not None:
+            os.environ["GEMINI_API_KEY"] = saved
+
+
+def t22_summary_has_ai_debrief_slot():
+    print("\n[22] Per-set summary always carries an `ai_debrief` slot (None on first emit)")
+    tr = PoseTracker(show_window=False)
+    tr._set_start_t = 0.0
+    summary = tr._build_summary(0.0)
+    check("'ai_debrief' key present", "ai_debrief" in summary, "present",
+          "present" if "ai_debrief" in summary else "MISSING")
+    check("'ai_debrief' is None on initial emit", summary["ai_debrief"] is None,
+          None, summary["ai_debrief"])
+    check("'profile' present in summary", "profile" in summary, "present",
+          "present" if "profile" in summary else "MISSING")
+
+
+# ---------------------------------------------------------------------------
 # Main.
 # ---------------------------------------------------------------------------
 def main() -> int:
@@ -433,7 +531,10 @@ def main() -> int:
                t10_eccentric_concentric_split, t11_imu_dominated_rep_voided,
                t12_force_reset_to_up, t13_summary_structure_and_trends,
                t14_setup_no_person, t15_setup_legs_out_of_frame,
-               t16_setup_front_view, t17_setup_ok):
+               t16_setup_front_view, t17_setup_ok,
+               t18_profile_drives_thresholds, t19_depth_state_follows_profile,
+               t20_set_profile_is_queued_until_reset,
+               t21_ai_agent_no_key_is_silent, t22_summary_has_ai_debrief_slot):
         fn()
     print("=" * 72)
     passed = sum(results)
