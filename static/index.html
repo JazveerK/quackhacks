@@ -1,0 +1,477 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>PhysioFusion — Live</title>
+<style>
+  :root {
+    --bg: #0b1020;
+    --panel: #131a33;
+    --panel-2: #1a2347;
+    --text: #e8ecf7;
+    --muted: #8c95b8;
+    --accent: #4dd6ff;
+    --good: #4ade80;
+    --warn: #fbbf24;
+    --bad: #f87171;
+    --imu: #c084fc;
+    --camera: #4dd6ff;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  }
+  body {
+    display: grid;
+    grid-template-columns: 1fr 380px;
+    grid-template-rows: 56px 1fr;
+    gap: 12px;
+    padding: 12px;
+  }
+  header {
+    grid-column: 1 / -1;
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0 16px;
+    background: var(--panel);
+    border-radius: 10px;
+  }
+  header h1 {
+    margin: 0; font-size: 18px; letter-spacing: 0.5px;
+    display: flex; align-items: center; gap: 10px;
+  }
+  header h1 .dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: var(--bad); box-shadow: 0 0 8px var(--bad);
+    transition: background 0.2s;
+  }
+  header h1 .dot.connected { background: var(--good); box-shadow: 0 0 8px var(--good); }
+  header .right { display: flex; gap: 8px; align-items: center; }
+  button {
+    background: var(--panel-2); color: var(--text);
+    border: 1px solid #2c3866;
+    border-radius: 8px;
+    padding: 8px 14px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary {
+    background: var(--accent); color: #002337; border-color: var(--accent);
+    font-weight: 600;
+  }
+
+  .stage {
+    background: var(--panel);
+    border-radius: 10px;
+    overflow: hidden;
+    position: relative;
+    display: flex; align-items: center; justify-content: center;
+    min-height: 0;
+  }
+  .stage img {
+    width: 100%; height: 100%;
+    object-fit: contain;
+    background: #000;
+  }
+  .stage .no-feed {
+    color: var(--muted); font-size: 14px;
+  }
+  .stage .overlay-flag {
+    position: absolute; top: 16px; left: 16px;
+    padding: 10px 16px;
+    background: rgba(11,16,32,0.75);
+    border-left: 4px solid var(--warn);
+    border-radius: 6px;
+    font-size: 18px; font-weight: 600;
+    opacity: 0; transition: opacity 0.25s;
+  }
+  .stage .overlay-flag.show { opacity: 1; }
+
+  .sidebar {
+    display: grid;
+    grid-template-rows: auto auto auto auto 1fr auto;
+    gap: 12px;
+    min-height: 0;
+  }
+  .card {
+    background: var(--panel);
+    border-radius: 10px;
+    padding: 14px 16px;
+  }
+  .card h2 {
+    margin: 0 0 8px 0; font-size: 11px;
+    color: var(--muted); text-transform: uppercase; letter-spacing: 1.2px;
+  }
+
+  /* Tracking source — the money shot */
+  .source {
+    display: flex; align-items: center; gap: 12px;
+    padding: 16px;
+  }
+  .source .badge {
+    flex: 1;
+    text-align: center;
+    padding: 14px 8px;
+    border-radius: 10px;
+    font-weight: 700;
+    font-size: 16px;
+    letter-spacing: 1px;
+    border: 2px solid transparent;
+    background: var(--panel-2);
+    color: var(--muted);
+    transition: all 0.25s;
+  }
+  .source .badge.active.camera {
+    border-color: var(--camera);
+    color: var(--camera);
+    box-shadow: 0 0 18px rgba(77, 214, 255, 0.45);
+    background: rgba(77, 214, 255, 0.08);
+  }
+  .source .badge.active.imu {
+    border-color: var(--imu);
+    color: var(--imu);
+    box-shadow: 0 0 18px rgba(192, 132, 252, 0.45);
+    background: rgba(192, 132, 252, 0.08);
+  }
+  .source .arrow { color: var(--muted); font-size: 18px; }
+
+  /* Counter */
+  .counter {
+    display: flex; align-items: baseline; gap: 10px;
+    padding: 8px 4px 0 4px;
+  }
+  .counter .num { font-size: 64px; font-weight: 800; line-height: 1; }
+  .counter .of  { font-size: 18px; color: var(--muted); }
+  .counter .phase {
+    margin-left: auto; padding: 4px 10px;
+    border-radius: 999px; background: var(--panel-2);
+    font-size: 11px; color: var(--muted); letter-spacing: 1px;
+  }
+
+  /* Depth gauge */
+  .gauge {
+    position: relative;
+    height: 28px;
+    border-radius: 14px;
+    background: var(--panel-2);
+    overflow: hidden;
+    margin-top: 6px;
+  }
+  .gauge .fill {
+    position: absolute; left: 0; top: 0; bottom: 0;
+    background: linear-gradient(90deg, var(--good), var(--accent));
+    width: 0%;
+    transition: width 0.15s linear;
+  }
+  .gauge .target {
+    position: absolute; top: -4px; bottom: -4px;
+    width: 2px; background: var(--warn);
+  }
+  .gauge .target::after {
+    content: "PARALLEL";
+    position: absolute; top: -16px; left: 4px;
+    font-size: 9px; letter-spacing: 1px;
+    color: var(--warn); white-space: nowrap;
+  }
+  .gauge-row {
+    display: flex; justify-content: space-between;
+    font-size: 11px; color: var(--muted); margin-top: 4px;
+  }
+
+  /* Stats */
+  .stats {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+  .stat { background: var(--panel-2); border-radius: 8px; padding: 8px 10px; }
+  .stat .label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; }
+  .stat .value { font-size: 18px; font-weight: 600; }
+
+  /* Rep bars */
+  .reps {
+    flex: 1; min-height: 0;
+    display: flex; flex-direction: column;
+  }
+  .reps .bars {
+    flex: 1; display: flex; align-items: flex-end; gap: 4px;
+    padding-top: 8px;
+    border-bottom: 1px dashed #2c3866;
+    min-height: 80px;
+  }
+  .reps .bars .bar {
+    flex: 1;
+    background: var(--accent);
+    border-radius: 3px 3px 0 0;
+    transition: height 0.2s;
+  }
+  .reps .bars .bar.shallow { background: var(--warn); }
+
+  .controls { display: flex; gap: 8px; }
+  .controls button { flex: 1; }
+
+  /* Set debrief modal */
+  .debrief-bg {
+    position: fixed; inset: 0;
+    background: rgba(11,16,32,0.85);
+    display: none; align-items: center; justify-content: center;
+    z-index: 50;
+  }
+  .debrief-bg.show { display: flex; }
+  .debrief {
+    background: var(--panel);
+    border-radius: 12px;
+    width: min(560px, 90vw);
+    padding: 24px;
+  }
+  .debrief h2 {
+    margin: 0 0 12px 0; font-size: 22px;
+    color: var(--accent); letter-spacing: 0.5px;
+  }
+  .debrief .summary-row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+  .debrief .summary-row .stat { flex: 1; min-width: 100px; }
+  .debrief pre {
+    background: var(--panel-2); border-radius: 8px;
+    padding: 12px; font-size: 12px; max-height: 180px;
+    overflow: auto; color: var(--muted);
+  }
+  .debrief .actions { display: flex; gap: 8px; margin-top: 16px; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>
+      <span class="dot" id="conn"></span>
+      PhysioFusion <span style="color: var(--muted); font-weight: 400;">— Bodyweight Squat</span>
+    </h1>
+    <div class="right">
+      <button id="btn-end">End Set</button>
+      <button id="btn-reset" class="primary">Start Next Set</button>
+    </div>
+  </header>
+
+  <section class="stage">
+    <img id="feed" alt="Live feed" />
+    <div class="no-feed" id="no-feed">Waiting for camera…</div>
+    <div class="overlay-flag" id="overlay-flag"></div>
+  </section>
+
+  <aside class="sidebar">
+    <div class="card source">
+      <div class="badge camera" id="src-cam">CAMERA</div>
+      <div class="arrow">⇄</div>
+      <div class="badge imu" id="src-imu">IMU</div>
+    </div>
+
+    <div class="card">
+      <h2>Reps</h2>
+      <div class="counter">
+        <span class="num" id="rep-count">0</span>
+        <span class="of">/ <span id="rep-target">10</span></span>
+        <span class="phase" id="phase">SET_ACTIVE</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Knee angle &amp; depth</h2>
+      <div class="gauge">
+        <div class="fill" id="gauge-fill"></div>
+        <div class="target" id="gauge-target"></div>
+      </div>
+      <div class="gauge-row">
+        <span><span id="angle">—</span>°</span>
+        <span>ROM: <span id="rom-min">—</span>° / <span id="rom-max">—</span>°</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Signal quality</h2>
+      <div class="stats">
+        <div class="stat">
+          <div class="label">Tempo</div>
+          <div class="value"><span id="tempo">—</span>s</div>
+        </div>
+        <div class="stat">
+          <div class="label">Camera visibility</div>
+          <div class="value"><span id="vis">—</span></div>
+        </div>
+        <div class="stat">
+          <div class="label">IMU quality</div>
+          <div class="value"><span id="imuq">—</span></div>
+        </div>
+        <div class="stat">
+          <div class="label">Depth state</div>
+          <div class="value" style="font-size: 13px;"><span id="depth-state">—</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card reps">
+      <h2>Per-rep depth</h2>
+      <div class="bars" id="bars"></div>
+    </div>
+  </aside>
+
+  <div class="debrief-bg" id="debrief-bg">
+    <div class="debrief">
+      <h2>Set debrief</h2>
+      <div class="summary-row" id="summary-row"></div>
+      <pre id="summary-json"></pre>
+      <p style="color: var(--muted); font-size: 12px; margin: 8px 0 0 0;">
+        Gemini debrief + voice playback wires in here (Agent C).
+      </p>
+      <div class="actions">
+        <button id="btn-close">Close</button>
+        <button id="btn-next" class="primary">Start Next Set</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+(() => {
+  // ---- DOM refs ----
+  const el = id => document.getElementById(id);
+  const feed = el("feed"), noFeed = el("no-feed"), conn = el("conn");
+  const srcCam = el("src-cam"), srcImu = el("src-imu");
+  const repCount = el("rep-count"), repTarget = el("rep-target"), phaseEl = el("phase");
+  const angleEl = el("angle"), romMin = el("rom-min"), romMax = el("rom-max");
+  const gaugeFill = el("gauge-fill"), gaugeTarget = el("gauge-target");
+  const tempoEl = el("tempo"), visEl = el("vis"), imuqEl = el("imuq"), depthEl = el("depth-state");
+  const barsEl = el("bars"), overlayFlag = el("overlay-flag");
+  const debriefBg = el("debrief-bg"), summaryRow = el("summary-row"), summaryJson = el("summary-json");
+
+  // ---- Depth gauge config (knee angle 60..180, target 95) ----
+  const A_MIN = 60, A_MAX = 180, A_TARGET = 95;
+  function setAngle(a) {
+    // Fill grows as user squats deeper (lower angle).
+    const t = Math.max(0, Math.min(1, (A_MAX - a) / (A_MAX - A_MIN)));
+    gaugeFill.style.width = (t * 100) + "%";
+  }
+  function placeTarget() {
+    const t = (A_MAX - A_TARGET) / (A_MAX - A_MIN);
+    gaugeTarget.style.left = (t * 100) + "%";
+  }
+  placeTarget();
+
+  // ---- WebSocket ----
+  let ws = null;
+  let reconnectMs = 500;
+  function connect() {
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    ws = new WebSocket(`${proto}://${location.host}/ws`);
+    ws.onopen = () => {
+      conn.classList.add("connected");
+      reconnectMs = 500;
+    };
+    ws.onclose = () => {
+      conn.classList.remove("connected");
+      setTimeout(connect, reconnectMs);
+      reconnectMs = Math.min(reconnectMs * 2, 4000);
+    };
+    ws.onmessage = ev => {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch { return; }
+      if (msg.type === "frame") onFrame(msg.jpeg);
+      else if (msg.type === "state") onState(msg.state);
+      else if (msg.type === "set_end") onSetEnd(msg.summary);
+    };
+  }
+
+  function onFrame(b64) {
+    if (noFeed) noFeed.style.display = "none";
+    feed.src = "data:image/jpeg;base64," + b64;
+  }
+
+  let flagTimer = null;
+  function onState(s) {
+    setAngle(s.angle);
+    angleEl.textContent = s.angle.toFixed(1);
+    repCount.textContent = s.rep_count;
+    repTarget.textContent = s.rep_target;
+    phaseEl.textContent = s.phase;
+    romMin.textContent = s.rom_min.toFixed(0);
+    romMax.textContent = s.rom_max.toFixed(0);
+    tempoEl.textContent = s.tempo > 0 ? s.tempo.toFixed(1) : "—";
+    visEl.textContent = s.landmark_visibility.toFixed(2);
+    imuqEl.textContent = s.imu_quality.toFixed(2);
+    depthEl.textContent = (s.depth_state || "—").replace("_", " ");
+
+    // Tracking source money shot.
+    const cam = s.tracking_source === "camera";
+    srcCam.classList.toggle("active", cam);
+    srcImu.classList.toggle("active", !cam);
+
+    // Form flag overlay.
+    if (s.form_flags && s.form_flags.length) {
+      overlayFlag.textContent = labelForFlag(s.form_flags[0]);
+      overlayFlag.classList.add("show");
+      if (flagTimer) clearTimeout(flagTimer);
+      flagTimer = setTimeout(() => overlayFlag.classList.remove("show"), 1500);
+    }
+
+    // Per-rep bars.
+    renderBars(s.rep_depths || []);
+  }
+
+  function labelForFlag(f) {
+    if (f === "shallow")  return "Go deeper";
+    if (f === "too_fast") return "Slow it down";
+    return f.replace("_", " ");
+  }
+
+  function renderBars(depths) {
+    if (depths.length === barsEl.childElementCount) {
+      // fast path: same length, no-op
+      return;
+    }
+    barsEl.innerHTML = "";
+    if (!depths.length) return;
+    const minA = Math.min(...depths, A_TARGET) - 5;
+    const maxA = 180;
+    for (const d of depths) {
+      const t = Math.max(0.05, Math.min(1, (maxA - d) / (maxA - minA)));
+      const bar = document.createElement("div");
+      bar.className = "bar" + (d > 100 ? " shallow" : "");
+      bar.style.height = (t * 100) + "%";
+      bar.title = `${d.toFixed(0)}°`;
+      barsEl.appendChild(bar);
+    }
+  }
+
+  function onSetEnd(summary) {
+    summaryRow.innerHTML = "";
+    const items = [
+      ["Reps", `${summary.reps_completed} / ${summary.rep_target}`],
+      ["Min angle", `${Math.min(...(summary.rep_depths_deg || [180])).toFixed(0)}°`],
+      ["Trend", (summary.depth_trend || "consistent").replace("_", " ")],
+      ["Fatigue", summary.fatigue_signal || "none"],
+    ];
+    for (const [k, v] of items) {
+      const d = document.createElement("div");
+      d.className = "stat";
+      d.innerHTML = `<div class="label">${k}</div><div class="value" style="font-size:14px">${v}</div>`;
+      summaryRow.appendChild(d);
+    }
+    summaryJson.textContent = JSON.stringify(summary, null, 2);
+    debriefBg.classList.add("show");
+  }
+
+  el("btn-end").onclick = () => ws && ws.readyState === 1 && ws.send(JSON.stringify({cmd: "end_set"}));
+  el("btn-reset").onclick = () => {
+    ws && ws.readyState === 1 && ws.send(JSON.stringify({cmd: "reset_set"}));
+    debriefBg.classList.remove("show");
+  };
+  el("btn-close").onclick = () => debriefBg.classList.remove("show");
+  el("btn-next").onclick  = () => {
+    ws && ws.readyState === 1 && ws.send(JSON.stringify({cmd: "reset_set"}));
+    debriefBg.classList.remove("show");
+  };
+
+  connect();
+})();
+</script>
+</body>
+</html>

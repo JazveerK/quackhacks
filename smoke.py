@@ -1,0 +1,446 @@
+"""
+Headless smoke tests for the PhysioFusion rep counter.
+
+No webcam, no MediaPipe — synthesizes knee-angle traces and feeds them into
+SquatCounter directly. This is the layer where the "10 phantom reps while
+standing" bug lived, so this is what we want to lock down.
+
+Run:
+    .venv/bin/python smoke.py
+"""
+
+from __future__ import annotations
+
+import math
+import sys
+import time
+
+import pose_tracker
+from pose_tracker import (
+    SquatCounter,
+    PoseTracker,
+    DEBOUNCE_FRAMES,
+    DOWN_ENTER_DEG,
+    UP_ENTER_DEG,
+    PARALLEL_DEG,
+    MIN_REP_SEC,
+    MAX_REP_SEC,
+    MIN_CAM_FRAC,
+    FAST_REP_SEC,
+    NO_POSE_SETUP_SEC,
+    LM,
+)
+
+FPS = 30
+DT = 1.0 / FPS
+
+
+# ---------------------------------------------------------------------------
+# Trace generators. Each is a function t -> angle_deg, or None when the
+# trace is finished.
+# ---------------------------------------------------------------------------
+def squat_wave(
+    num_reps: int,
+    descent_s: float = 1.2,
+    hold_s: float = 0.3,
+    ascent_s: float = 1.2,
+    rest_s: float = 0.5,
+    top_deg: float = 175.0,
+    bot_deg: float = 85.0,
+):
+    period = descent_s + hold_s + ascent_s + rest_s
+    total = period * num_reps
+
+    def f(t: float):
+        if t > total:
+            return None
+        local = t % period
+        if local < descent_s:
+            return top_deg - (top_deg - bot_deg) * (local / descent_s)
+        local -= descent_s
+        if local < hold_s:
+            return bot_deg
+        local -= hold_s
+        if local < ascent_s:
+            return bot_deg + (top_deg - bot_deg) * (local / ascent_s)
+        return top_deg
+    return f
+
+
+def flat(angle: float, duration_s: float):
+    def f(t: float):
+        return None if t > duration_s else angle
+    return f
+
+
+def noisy(angle: float, amplitude: float, duration_s: float, freq: float = 1.0):
+    def f(t: float):
+        if t > duration_s:
+            return None
+        return angle + amplitude * math.sin(2 * math.pi * freq * t)
+    return f
+
+
+def run_trace(angle_at_time) -> SquatCounter:
+    counter = SquatCounter()
+    t = 0.0
+    while True:
+        a = angle_at_time(t)
+        if a is None:
+            return counter
+        counter.update(a, t)
+        t += DT
+
+
+# ---------------------------------------------------------------------------
+# Assertion helpers.
+# ---------------------------------------------------------------------------
+results: list[bool] = []
+
+def check(name: str, ok: bool, expected, actual):
+    sigil = "PASS" if ok else "FAIL"
+    print(f"  [{sigil}] {name:<48} expected={expected!s:<14} actual={actual!s}")
+    results.append(ok)
+
+
+# ---------------------------------------------------------------------------
+# Tests.
+# ---------------------------------------------------------------------------
+def t1_clean_deep():
+    print("\n[1] 10 clean deep squats (3.2s each, min 85°)")
+    c = run_trace(squat_wave(10))
+    check("rep_count == 10", c.rep_count == 10, 10, c.rep_count)
+    check("no shallow flags", c.flag_counts["shallow"] == 0, 0, c.flag_counts["shallow"])
+    check("no too_fast flags", c.flag_counts["too_fast"] == 0, 0, c.flag_counts["too_fast"])
+    if c.rep_depths:
+        check("min depth below parallel", min(c.rep_depths) < PARALLEL_DEG,
+              f"<{PARALLEL_DEG}°", f"{min(c.rep_depths):.1f}°")
+
+
+def t2_shallow():
+    print("\n[2] 5 shallow squats (bottom 105°, above parallel)")
+    c = run_trace(squat_wave(5, bot_deg=105.0))
+    check("rep_count == 5", c.rep_count == 5, 5, c.rep_count)
+    check("shallow flag >= 5", c.flag_counts["shallow"] >= 5,
+          ">=5", c.flag_counts["shallow"])
+
+
+def t3_standing_still():
+    print("\n[3] 10s standing still at 175°")
+    c = run_trace(flat(175.0, 10.0))
+    check("rep_count == 0", c.rep_count == 0, 0, c.rep_count)
+
+
+def t4_noisy_idle():
+    print("\n[4] 10s noisy idle (170° ± 8°)")
+    c = run_trace(noisy(170.0, 8.0, 10.0, freq=0.7))
+    check("rep_count == 0", c.rep_count == 0, 0, c.rep_count)
+
+
+def t5_single_spurious_dip():
+    print("\n[5] One spurious frame to 100° (below DOWN_ENTER_DEG)")
+    def trace(t: float):
+        if t > 5.0:
+            return None
+        if 2.000 <= t <= 2.001:
+            return 100.0
+        return 175.0
+    c = run_trace(trace)
+    check("rep_count == 0 (debounced)", c.rep_count == 0, 0, c.rep_count)
+
+
+def t6_too_brief_dip():
+    print(f"\n[6] 2-frame dip past threshold (< DEBOUNCE_FRAMES={DEBOUNCE_FRAMES})")
+    counter = SquatCounter()
+    t = 0.0
+    for _ in range(30):
+        counter.update(175.0, t); t += DT
+    for _ in range(DEBOUNCE_FRAMES - 1):
+        counter.update(100.0, t); t += DT
+    for _ in range(30):
+        counter.update(175.0, t); t += DT
+    check("rep_count == 0 (below debounce)", counter.rep_count == 0, 0, counter.rep_count)
+
+
+def t7_impossibly_fast():
+    print(f"\n[7] Rep completing in ~0.2s (< MIN_REP_SEC={MIN_REP_SEC}s) — voided")
+    counter = SquatCounter()
+    t = 0.0
+    # enter down phase
+    for _ in range(DEBOUNCE_FRAMES):
+        counter.update(100.0, t); t += DT
+    # immediately back up
+    for _ in range(DEBOUNCE_FRAMES):
+        counter.update(170.0, t); t += DT
+    check("rep_count == 0 (too fast voided)", counter.rep_count == 0, 0, counter.rep_count)
+
+
+def t8_fast_but_legit():
+    print(f"\n[8] 3 reps, tempo ~1.3s (>= MIN_REP_SEC, < FAST_REP_SEC={FAST_REP_SEC}s)")
+    c = run_trace(squat_wave(3, descent_s=0.5, hold_s=0.3, ascent_s=0.5, rest_s=0.4))
+    check("rep_count == 3", c.rep_count == 3, 3, c.rep_count)
+    check("too_fast flag >= 3", c.flag_counts["too_fast"] >= 3,
+          ">=3", c.flag_counts["too_fast"])
+
+
+def t9_source_switch_pause():
+    print("\n[9] Source-switch guard (pause_streaks resets a near-trigger streak)")
+    counter = SquatCounter()
+    t = 0.0
+    # build a partial down_streak (one short of trigger)
+    for _ in range(DEBOUNCE_FRAMES - 1):
+        counter.update(100.0, t); t += DT
+    counter.pause_streaks()        # simulate camera<->IMU handoff
+    counter.update(100.0, t); t += DT   # would have crossed debounce without pause
+    counter.update(170.0, t); t += DT
+    check("rep_count == 0 (streak cleared)", counter.rep_count == 0, 0, counter.rep_count)
+
+
+# ---------------------------------------------------------------------------
+# Helper: drive a single realistic squat through the counter.
+# ---------------------------------------------------------------------------
+def _drive_squat(
+    counter: SquatCounter, t0: float, *,
+    descent_s: float = 1.2, hold_s: float = 0.3, ascent_s: float = 1.2,
+    rest_s: float = 0.5, top: float = 175.0, bot: float = 90.0,
+    source: str = "camera",
+) -> float:
+    """Drive one squat into `counter` starting at time t0. Returns new time."""
+    t = t0
+    n = lambda s: max(1, int(s * FPS))
+    # standing rest at top
+    for _ in range(n(rest_s)):
+        counter.update(top, t, source); t += DT
+    # descent
+    steps = n(descent_s)
+    for i in range(steps):
+        a = top - (top - bot) * (i + 1) / steps
+        counter.update(a, t, source); t += DT
+    # bottom hold
+    for _ in range(n(hold_s)):
+        counter.update(bot, t, source); t += DT
+    # ascent
+    for i in range(steps):
+        a = bot + (top - bot) * (i + 1) / n(ascent_s)
+        counter.update(a, t, source); t += DT
+    # back to standing
+    for _ in range(n(rest_s)):
+        counter.update(top, t, source); t += DT
+    return t
+
+
+def t10_eccentric_concentric_split():
+    print("\n[10] Eccentric (descent) vs concentric (ascent+hold) timing")
+    counter = SquatCounter()
+    _drive_squat(counter, 0.0, descent_s=1.0, hold_s=0.3, ascent_s=1.0)
+    check("rep_count == 1", counter.rep_count == 1, 1, counter.rep_count)
+    if counter.rep_count:
+        ecc = counter.rep_eccentric[0]
+        con = counter.rep_concentric[0]
+        check("eccentric ~ 1.0s (in 0.6..1.3)", 0.6 <= ecc <= 1.3, "0.6..1.3s", f"{ecc:.2f}s")
+        check("concentric ~ 1.3s (in 1.0..1.6)", 1.0 <= con <= 1.6, "1.0..1.6s", f"{con:.2f}s")
+        check("cam_frac == 1.0", counter.rep_cam_frac[0] == 1.0, 1.0, counter.rep_cam_frac[0])
+
+
+def t11_imu_dominated_rep_voided():
+    print(f"\n[11] Rep with > {1 - MIN_CAM_FRAC:.0%} IMU frames during down phase -> voided")
+    counter = SquatCounter()
+    t = 0.0
+    # standing
+    for _ in range(int(0.5 * FPS)):
+        counter.update(175.0, t, "camera"); t += DT
+    # descent (camera) — this just gets us into down phase
+    steps = int(1.0 * FPS)
+    for i in range(steps):
+        a = 175.0 - (175 - 90) * (i + 1) / steps
+        counter.update(a, t, "camera"); t += DT
+    # long bottom hold with IMU source (simulating occlusion mid-rep)
+    for _ in range(int(3.0 * FPS)):
+        counter.update(90.0, t, "imu"); t += DT
+    # ascent (camera)
+    for i in range(steps):
+        a = 90.0 + (175 - 90) * (i + 1) / steps
+        counter.update(a, t, "camera"); t += DT
+    for _ in range(int(0.5 * FPS)):
+        counter.update(175.0, t, "camera"); t += DT
+    check("rep_count == 0", counter.rep_count == 0, 0, counter.rep_count)
+    check("voided_reps == 1", counter.voided_reps == 1, 1, counter.voided_reps)
+
+
+def t12_force_reset_to_up():
+    print("\n[12] force_reset_to_up abandons in-progress rep cleanly")
+    counter = SquatCounter()
+    t = 0.0
+    # enter down phase
+    for _ in range(int(0.5 * FPS)):
+        counter.update(175.0, t, "camera"); t += DT
+    for i in range(int(1.0 * FPS)):
+        counter.update(90.0, t, "camera"); t += DT
+    # user sat down — assert we're in down phase, then force reset
+    check("in 'down' before reset", counter.current_phase() == "down", "down", counter.current_phase())
+    counter.force_reset_to_up()
+    check("back to 'up' after reset", counter.current_phase() == "up", "up", counter.current_phase())
+    check("rep_count still 0", counter.rep_count == 0, 0, counter.rep_count)
+    # And a clean rep after reset should count.
+    _drive_squat(counter, t, descent_s=1.0, hold_s=0.3, ascent_s=1.0)
+    check("rep_count == 1 after fresh rep", counter.rep_count == 1, 1, counter.rep_count)
+
+
+def t13_summary_structure_and_trends():
+    print("\n[13] Per-set summary shape: legacy fields + analysis + templated_debrief")
+    tracker = PoseTracker(show_window=False)
+    tracker._set_start_t = 0.0
+    t = 0.0
+    # 6 reps; the last 2 are shallow (bot=105) to trigger declining_late + shallow flag
+    for i in range(6):
+        bot = 90.0 if i < 4 else 105.0
+        t = _drive_squat(tracker.counter, t, descent_s=1.0, hold_s=0.3,
+                         ascent_s=1.0, rest_s=0.4, bot=bot)
+    # Simulate the source aggregates.
+    tracker._cam_frame_count = 1000
+    tracker._imu_frame_count = 0
+    summary = tracker._build_summary(t)
+
+    # Legacy 4d top-level keys.
+    for k in ("exercise", "reps_completed", "rep_target", "rep_depths_deg",
+              "target_depth_deg", "depth_trend", "form_flag_counts",
+              "fatigue_signal"):
+        check(f"top-level '{k}'", k in summary, "present",
+              "present" if k in summary else "MISSING")
+
+    # Analysis sub-blocks.
+    a = summary.get("analysis", {})
+    for k in ("set_duration_sec", "voided_reps", "depth", "tempo",
+              "rom", "form", "tracking"):
+        check(f"analysis.{k}", k in a, "present",
+              "present" if k in a else "MISSING")
+
+    # Specific PT-relevant fields the AI agent will reach for.
+    depth = a.get("depth", {})
+    for k in ("mean_deg", "stddev_deg", "target_hit_rate", "trend",
+              "first_half_avg_deg", "second_half_avg_deg", "halves_delta_deg"):
+        check(f"depth.{k}", k in depth, "present",
+              "present" if k in depth else "MISSING")
+    tempo = a.get("tempo", {})
+    for k in ("eccentric_per_rep_sec", "concentric_per_rep_sec",
+              "mean_sec", "trend", "eccentric_concentric_ratio_mean"):
+        check(f"tempo.{k}", k in tempo, "present",
+              "present" if k in tempo else "MISSING")
+
+    # Behavior: late-set shallow reps should produce declining_late + shallow flag.
+    check("declining_late detected",
+          summary["depth_trend"] == "declining_late",
+          "declining_late", summary["depth_trend"])
+    check("shallow_rep_indices populated",
+          len(a["form"]["shallow_rep_indices"]) >= 2,
+          ">=2", len(a["form"]["shallow_rep_indices"]))
+
+    # Templated debrief is always a non-empty string.
+    td = summary.get("templated_debrief", "")
+    check("templated_debrief non-empty", isinstance(td, str) and len(td) > 20,
+          ">20 char str", f"{type(td).__name__}({len(td) if isinstance(td, str) else '?'})")
+
+
+# ---------------------------------------------------------------------------
+# Setup classifier tests. Synthetic landmark list (33 entries, MediaPipe size).
+# ---------------------------------------------------------------------------
+class _SynthLM:
+    def __init__(self, x: float = 0.5, y: float = 0.5, vis: float = 0.0) -> None:
+        self.x = x; self.y = y; self.visibility = vis
+
+
+def _synth_pose(side_view: bool = True, full_body: bool = True) -> list:
+    """Build a 33-landmark list with shoulders/hips/legs filled in."""
+    lms = [_SynthLM() for _ in range(33)]
+    if side_view:
+        # Shoulders/hips overlapping in x (small spread).
+        lms[LM.LEFT_SHOULDER.value]  = _SynthLM(x=0.50, y=0.30, vis=0.9)
+        lms[LM.RIGHT_SHOULDER.value] = _SynthLM(x=0.50, y=0.30, vis=0.9)
+        lms[LM.LEFT_HIP.value]       = _SynthLM(x=0.50, y=0.55, vis=0.9)
+        lms[LM.RIGHT_HIP.value]      = _SynthLM(x=0.50, y=0.55, vis=0.9)
+    else:
+        # Spread out — front view.
+        lms[LM.LEFT_SHOULDER.value]  = _SynthLM(x=0.35, y=0.30, vis=0.9)
+        lms[LM.RIGHT_SHOULDER.value] = _SynthLM(x=0.65, y=0.30, vis=0.9)
+        lms[LM.LEFT_HIP.value]       = _SynthLM(x=0.40, y=0.55, vis=0.9)
+        lms[LM.RIGHT_HIP.value]      = _SynthLM(x=0.60, y=0.55, vis=0.9)
+    if full_body:
+        for idx in (LM.LEFT_KNEE.value, LM.RIGHT_KNEE.value,
+                    LM.LEFT_ANKLE.value, LM.RIGHT_ANKLE.value):
+            lms[idx] = _SynthLM(x=0.50, y=0.80, vis=0.9)
+    return lms
+
+
+def t14_setup_no_person():
+    print("\n[14] Setup classifier: no pose detected -> 'no_person' (blocking)")
+    tr = PoseTracker(show_window=False)
+    tr._last_frame_t = time.time()
+    # last_pose_t stays None -> treated as "long ago"
+    status = tr._classify_setup(None, 0.0, 0.0, False, time.time())
+    check("code == no_person", status["code"] == "no_person",
+          "no_person", status["code"])
+    check("severity == blocking", status["severity"] == "blocking",
+          "blocking", status["severity"])
+
+
+def t15_setup_legs_out_of_frame():
+    print("\n[15] Setup classifier: shoulders OK, legs low-vis -> 'legs_out_of_frame'")
+    tr = PoseTracker(show_window=False)
+    tr._last_frame_t = time.time()
+    landmarks = _synth_pose(side_view=True, full_body=False)
+    status = tr._classify_setup(landmarks, leg_vis=0.1, leg_vis_min=0.0,
+                                camera_trusted=False, now=time.time())
+    check("code == legs_out_of_frame",
+          status["code"] == "legs_out_of_frame",
+          "legs_out_of_frame", status["code"])
+
+
+def t16_setup_front_view():
+    print("\n[16] Setup classifier: full body but front-facing -> 'not_side_view'")
+    tr = PoseTracker(show_window=False)
+    tr._last_frame_t = time.time()
+    landmarks = _synth_pose(side_view=False, full_body=True)
+    status = tr._classify_setup(landmarks, leg_vis=0.85, leg_vis_min=0.7,
+                                camera_trusted=True, now=time.time())
+    check("code == not_side_view",
+          status["code"] == "not_side_view",
+          "not_side_view", status["code"])
+
+
+def t17_setup_ok():
+    print("\n[17] Setup classifier: side-on full body, good vis -> 'ok'")
+    tr = PoseTracker(show_window=False)
+    tr._last_frame_t = time.time()
+    landmarks = _synth_pose(side_view=True, full_body=True)
+    status = tr._classify_setup(landmarks, leg_vis=0.85, leg_vis_min=0.7,
+                                camera_trusted=True, now=time.time())
+    check("code == ok", status["code"] == "ok", "ok", status["code"])
+    check("severity == good", status["severity"] == "good", "good", status["severity"])
+
+
+# ---------------------------------------------------------------------------
+# Main.
+# ---------------------------------------------------------------------------
+def main() -> int:
+    print("PhysioFusion rep-counter smoke tests")
+    print(f"  FPS={FPS} DEBOUNCE_FRAMES={DEBOUNCE_FRAMES} "
+          f"DOWN<{DOWN_ENTER_DEG}° UP>{UP_ENTER_DEG}° "
+          f"MIN_REP_SEC={MIN_REP_SEC}s")
+    print("=" * 72)
+    for fn in (t1_clean_deep, t2_shallow, t3_standing_still, t4_noisy_idle,
+               t5_single_spurious_dip, t6_too_brief_dip, t7_impossibly_fast,
+               t8_fast_but_legit, t9_source_switch_pause,
+               t10_eccentric_concentric_split, t11_imu_dominated_rep_voided,
+               t12_force_reset_to_up, t13_summary_structure_and_trends,
+               t14_setup_no_person, t15_setup_legs_out_of_frame,
+               t16_setup_front_view, t17_setup_ok):
+        fn()
+    print("=" * 72)
+    passed = sum(results)
+    total = len(results)
+    print(f"OVERALL: {passed}/{total} {'ALL PASS' if passed == total else 'FAILURES'}")
+    return 0 if passed == total else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
