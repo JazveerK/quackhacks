@@ -11,16 +11,20 @@ QuackHacks 3 (24h hackathon). Three-agent team.
 - **[`CONTEXT.md`](CONTEXT.md)** — project brief + data contracts. Read first.
 - **[`HANDOFF_FRONTEND.md`](HANDOFF_FRONTEND.md)** — WebSocket / 4c / 4d contract reference
   for the dashboard + Gemini wiring.
+- **[`HANDOFF_VOICE_IN.md`](HANDOFF_VOICE_IN.md)** — Web Speech API + "Hey coach"
+  + 4 commands brief for Agent C's voice input.
 
 ## What's in the repo
 
 | File | Owner | Status |
 |---|---|---|
-| `pose_tracker.py` | Agent B | Done — pose tracking + fusion + rep state machine + 4c/4d + setup hints |
-| `mock_state.py` | (shared) | Done — fake 4c stream + 4d summary, matches current contracts |
-| `smoke.py` | Agent B | Done — 60 backend assertions |
+| `pose_tracker.py` | Agent B | Done — pose tracking + fusion + rep state machine + 4c/4d + setup hints + profile-driven targets |
+| `profile.py` | Agent B | Done — `PTProfile` dataclass + Sam (post-ACL) default |
+| `ai_agent.py` | Agent B | Done — Gemini Flash wrappers (prescription parse + clinical debrief) |
+| `mock_state.py` | (shared) | Done — fake 4c stream + 4d summary including profile + ai_debrief |
+| `smoke.py` | Agent B | Done — backend assertions (counter, profile binding, setup classifier) |
 | `run.py` | Agent B | Done — standalone launcher (mac webcam pre-flight) |
-| `server.py` | Agent C | **Placeholder** — current file is a smoke server. Agent C rewrites per CONTEXT.md §5 |
+| `server.py` | Agent C | **Placeholder** — current file is a smoke server with upload + profile + ai_debrief broadcast wired. Agent C rewrites per CONTEXT.md §5 |
 | `static/index.html` | Agent C | **Placeholder** — minimal smoke UI. Agent C builds the real one |
 | `main.py` | (shared) | TODO — integration entry point. Wires Agent A's IMU + B's tracker + C's server |
 | `imu.py` | Agent A | TODO — real MPU6050 driver. `MockIMU` from `pose_tracker.py` is the stand-in |

@@ -70,7 +70,7 @@ ws://127.0.0.1:8000/ws
 ```
 All messages are JSON text frames.
 
-### Server → client (3 message types)
+### Server → client (5 message types)
 
 **1. `frame`** — JPEG of the camera with skeleton already drawn on top.
 Roughly 20-30/s.
@@ -106,19 +106,31 @@ brief). Roughly 20-30/s. Throttle in your UI if needed.
       "severity": "good",
       "code": "ok",
       "hint": "Tracking — go."
+    },
+    "profile": {
+      "patient_name": "Sam",
+      "condition": "post-ACL repair, left knee, 6 weeks",
+      "sets": 3, "reps_per_set": 8,
+      "depth_deg": 100.0, "tempo_sec": 3.0,
+      "focus": "controlled eccentric; quad re-engagement",
+      "contraindications": ["no valgus collapse", "no pain in L knee"],
+      "source": "default"
     }
   }
 }
 ```
 
 `setup_status` is described in detail below — it's the camera-positioning
-guidance for the user.
+guidance for the user. `profile` is the active PT prescription (defaults to
+Sam) — display patient_name + reps_per_set + depth_deg somewhere on the
+dashboard so the upload feature is visible.
 
 **3. `set_end`** — fires exactly once per set, just after `phase` flips to
-`SET_END`. The top-level fields are the original 4d contract; the new
-`analysis` sub-object and `templated_debrief` were added for the Gemini agent
-(see "Set-end summary detail" below). Hand the whole thing to Gemini Flash —
-the richer the input, the more specific the debrief will be.
+`SET_END`. Includes the original 4d contract, the rich `analysis` sub-object,
+the `templated_debrief` fallback, the active `profile`, and an `ai_debrief`
+slot which is initially `null`. **The actual AI debrief arrives in a separate
+`ai_debrief` follow-up message ~1–3s later** (see message type 4 below) so
+the frame loop never blocks on the Gemini call.
 ```json
 {
   "type": "set_end",
@@ -132,13 +144,42 @@ the richer the input, the more specific the debrief will be.
     "form_flag_counts": {"shallow": 4, "too_fast": 3},
     "fatigue_signal": "depth_decline",
     "analysis": { /* see below */ },
-    "templated_debrief": "Completed 10 of 10 reps. Average depth 95° (70% at target)..."
+    "templated_debrief": "Completed 10 of 10 reps. Average depth 95° (70% at target)...",
+    "profile": { /* same shape as the profile block in state */ },
+    "ai_debrief": null
   }
 }
 ```
 
-When you connect, the server also sends the last cached `frame`, `state`, and
-`set_end` immediately so a fresh client isn't blank.
+**4. `ai_debrief`** — async follow-up to the most recent `set_end`. Arrives
+1–3 seconds after `set_end`. UI shows `templated_debrief` immediately on
+set_end, then swaps to (or augments with) this when it arrives. Never
+arrives if Gemini is unavailable or errors — keep `templated_debrief` as
+the always-on display.
+```json
+{
+  "type": "ai_debrief",
+  "text": "Nice work Sam. You hit depth on 5 of 8 reps...",
+  "summary_seq": 2
+}
+```
+`summary_seq` ties the debrief to the set that produced it so a stale
+in-flight debrief from a previous set can't overwrite the current one.
+
+**5. `profile`** — broadcast whenever the active PT profile changes (initial
+default on connect, after a PT prescription upload, after a `reset_set`
+applies a queued profile). Update any "current prescription" panel on the
+dashboard.
+```json
+{
+  "type": "profile",
+  "profile": { "patient_name": "Sam", "reps_per_set": 8, "depth_deg": 100.0, ... },
+  "source": "default" | "uploaded" | "parsed"
+}
+```
+
+When you connect, the server also sends the last cached `frame`, `profile`,
+`state`, `set_end`, and `ai_debrief` immediately so a fresh client isn't blank.
 
 ### Client → server (commands)
 
@@ -146,15 +187,64 @@ When you connect, the server also sends the last cached `frame`, `state`, and
 ```json
 {"cmd": "end_set"}
 ```
-Backend flips `phase` to `SET_END` and emits the `set_end` summary.
+Backend flips `phase` to `SET_END` and emits the `set_end` summary; the
+`ai_debrief` follow-up arrives 1–3s later (or never if Gemini is down).
 
 **Start a new set** (also resets ROM, flags, counters):
 ```json
 {"cmd": "reset_set", "rep_target": 10}
 ```
-`rep_target` is optional; omit to keep the previous target.
+`rep_target` is optional; omit to use the active profile's prescribed reps.
+On reset, any pending profile (queued from a prescription upload) is applied
+and a fresh `profile` message is broadcast.
 
-That's the entire command surface. If you need more, ask.
+That's the WS command surface. If you need more, ask.
+
+### HTTP — `POST /profile/upload`
+
+The PT pastes a free-form prescription text; backend parses with Gemini
+Flash and applies it as the active profile. **Strongest demo moment:**
+add a textarea + Submit button on the dashboard, render the parsed numbers
+appearing in the rep counter / depth gauge / banner.
+
+Request:
+```http
+POST /profile/upload
+content-type: application/json
+
+{
+  "text": "3 sets of 8 squats at 100 degrees depth, slow tempo, no valgus collapse. Patient: Sam, 6 weeks post L-knee ACL repair."
+}
+```
+
+Success (200) returns the parsed profile:
+```json
+{
+  "profile": {
+    "patient_name": "Sam",
+    "condition": "post-ACL repair, L knee, 6 weeks",
+    "sets": 3, "reps_per_set": 8,
+    "depth_deg": 100.0, "tempo_sec": 3.0,
+    "focus": "...", "contraindications": ["no valgus collapse"],
+    "source": "parsed"
+  },
+  "source": "uploaded"
+}
+```
+
+Errors:
+- 400 — empty text
+- 502 — Gemini not available (missing key, API error). Show the user a
+  friendly "couldn't parse — try editing the text" message; the previous
+  profile stays active.
+
+After a successful upload, the backend also broadcasts a `profile` WS
+message so all clients update their displays. No need to refetch.
+
+### HTTP — `GET /profile`
+
+Returns the current active profile (same shape as the WS `profile` message).
+Useful for an initial fetch if you don't want to wait for the WS replay.
 
 ---
 

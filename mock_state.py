@@ -23,6 +23,8 @@ from __future__ import annotations
 import math
 import time
 
+from profile import DEFAULT_PROFILE
+
 
 TARGET_DEPTH_DEG = 95
 PARALLEL_DEG = 100
@@ -99,6 +101,7 @@ def state_stream(rep_target: int = 10, fps: int = 30):
                 "tracking_source": "imu" if occluded else "camera",
                 "rep_depths": list(rep_depths),
                 "setup_status": _setup_occluded() if occluded else _setup_ok(),
+                "profile": DEFAULT_PROFILE.to_dict(),
             }
             time.sleep(frame_dt)
 
@@ -122,6 +125,7 @@ def state_stream(rep_target: int = 10, fps: int = 30):
         "tracking_source": "camera",
         "rep_depths": list(rep_depths),
         "setup_status": _setup_ok(),
+        "profile": DEFAULT_PROFILE.to_dict(),
     }
 
 
@@ -202,6 +206,19 @@ def sample_set_summary(rep_target: int = 10) -> dict:
         "Next set, drop the target by 2 reps and focus on hitting depth on every one."
     )
 
+    # Realistic AI debrief, post-ACL clinical voice. Agent C can render this
+    # in the debrief modal before the real Gemini call is wired up.
+    ai_debrief = (
+        f"Nice work {DEFAULT_PROFILE.patient_name}. "
+        f"You hit depth on {reps_at_target} of {len(depths)} reps, "
+        f"and your eccentric stayed solid early — that's the controlled "
+        "descent we're after for the quad re-engagement. The last three "
+        "reps came up about six degrees shy of target and your tempo "
+        "slowed, which is your fatigue point today. Next set, drop to "
+        "six reps and hold one count at the bottom of each so we keep "
+        "the depth from the start."
+    )
+
     return {
         # Legacy 4d (unchanged shape).
         "exercise": "bodyweight_squat",
@@ -254,6 +271,8 @@ def sample_set_summary(rep_target: int = 10) -> dict:
             },
         },
         "templated_debrief": templated,
+        "profile": DEFAULT_PROFILE.to_dict(),
+        "ai_debrief": ai_debrief,
     }
 
 

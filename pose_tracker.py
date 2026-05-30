@@ -29,8 +29,15 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
+from profile import PTProfile, DEFAULT_PROFILE
+
 # ---------------------------------------------------------------------------
 # Tunables. Squat-specific. Side view assumed.
+#
+# A few of these are *defaults*: TARGET_DEPTH_DEG, PARALLEL_DEG, FAST_REP_SEC,
+# REP_TARGET_DEFAULT are overridden at runtime by the active PT profile (see
+# PoseTracker.set_profile). The constants below are the fallback values used
+# when no profile is loaded.
 # ---------------------------------------------------------------------------
 REP_TARGET_DEFAULT = 10
 TARGET_DEPTH_DEG = 95           # at/below this knee angle counts as parallel
@@ -147,7 +154,19 @@ class SquatCounter:
         rep_end_t         — clock time the rep completed
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        target_depth_deg: float = TARGET_DEPTH_DEG,
+        fast_rep_sec: float = FAST_REP_SEC,
+        parallel_buffer_deg: float = 5.0,
+    ):
+        # Profile-driven thresholds (passed in at construction; constant for
+        # the duration of one set).
+        self.target_depth_deg = float(target_depth_deg)
+        self.fast_rep_sec = float(fast_rep_sec)
+        # "shallow" = bottom angle > parallel threshold; parallel is target + buffer.
+        self.parallel_deg = self.target_depth_deg + float(parallel_buffer_deg)
+
         self._s = _RepState()
         self.rep_count = 0
         self.rep_depths: list[float] = []
@@ -243,10 +262,10 @@ class SquatCounter:
                     self.rep_cam_frac.append(round(cam_frac, 2))
                     self.rep_end_t.append(now)
                     rep_flags: list[str] = []
-                    if depth > PARALLEL_DEG:
+                    if depth > self.parallel_deg:
                         rep_flags.append("shallow")
                         self.flag_counts["shallow"] += 1
-                    if tempo < FAST_REP_SEC:
+                    if tempo < self.fast_rep_sec:
                         rep_flags.append("too_fast")
                         self.flag_counts["too_fast"] += 1
                     self.rep_flags.append(rep_flags)
@@ -282,17 +301,21 @@ class PoseTracker:
         on_state: Optional[Callable[[dict], None]] = None,
         on_set_end: Optional[Callable[[dict], None]] = None,
         on_frame: Optional[Callable[[bytes], None]] = None,
-        rep_target: int = REP_TARGET_DEFAULT,
+        rep_target: Optional[int] = None,
         camera_index: int = 0,
         show_window: bool = True,
         jpeg_quality: int = 70,
         preferred_side: Optional[str] = None,
+        profile: Optional[PTProfile] = None,
+        on_ai_debrief: Optional[Callable[[str], None]] = None,
+        on_profile_change: Optional[Callable[[PTProfile], None]] = None,
     ):
         self.imu = imu_source or MockIMU()
         self.on_state = on_state or (lambda s: None)
         self.on_set_end = on_set_end or (lambda summary: None)
         self.on_frame = on_frame or (lambda jpeg: None)
-        self.rep_target = rep_target
+        self.on_ai_debrief = on_ai_debrief or (lambda text: None)
+        self.on_profile_change = on_profile_change or (lambda p: None)
         self.camera_index = camera_index
         self.show_window = show_window
         self.jpeg_quality = jpeg_quality
@@ -301,8 +324,24 @@ class PoseTracker:
         self.preferred_side = preferred_side
         self._stop = False
 
+        # Profile-driven runtime targets. If no profile passed, use the demo
+        # persona (Sam) so the dashboard has a story before any PT upload.
+        # An explicit rep_target arg (if given) wins over the profile's value
+        # so existing callers / tests stay unaffected.
+        self.profile: PTProfile = profile or DEFAULT_PROFILE
+        self.target_depth_deg: float = self.profile.depth_deg
+        self.fast_rep_sec: float = self.profile.tempo_sec
+        self.parallel_deg: float = self.target_depth_deg + 5.0
+        self.rep_target: int = (
+            int(rep_target) if rep_target is not None else self.profile.reps_per_set
+        )
+        # Pending profile takes effect on the next reset_set() — keeps thresholds
+        # stable inside the in-flight set so reps that already started don't
+        # change rules mid-stream.
+        self._pending_profile: Optional[PTProfile] = None
+
         self.phase = "SET_ACTIVE"
-        self.counter = SquatCounter()
+        self.counter = self._fresh_counter()
         self.rom_min = 180.0
         self.rom_max = 0.0
         self._active_flags: dict[str, float] = {}   # flag -> expiry epoch
@@ -333,11 +372,31 @@ class PoseTracker:
     def stop(self) -> None:
         self._stop = True
 
+    def set_profile(self, profile: PTProfile) -> None:
+        """Queue a new PT profile. Takes effect on the next `reset_set()`."""
+        self._pending_profile = profile.clamp()
+
+    def _fresh_counter(self) -> "SquatCounter":
+        return SquatCounter(
+            target_depth_deg=self.target_depth_deg,
+            fast_rep_sec=self.fast_rep_sec,
+        )
+
     def reset_set(self, rep_target: Optional[int] = None) -> None:
+        # Apply any pending profile first so the new set runs on new targets.
+        if self._pending_profile is not None:
+            self.profile = self._pending_profile
+            self.target_depth_deg = self.profile.depth_deg
+            self.fast_rep_sec = self.profile.tempo_sec
+            self.parallel_deg = self.target_depth_deg + 5.0
+            # Profile's reps_per_set wins unless the caller explicitly passed one.
+            if rep_target is None:
+                self.rep_target = int(self.profile.reps_per_set)
+            self._pending_profile = None
         if rep_target is not None:
-            self.rep_target = rep_target
+            self.rep_target = int(rep_target)
         self.phase = "SET_ACTIVE"
-        self.counter = SquatCounter()
+        self.counter = self._fresh_counter()
         self.rom_min = 180.0
         self.rom_max = 0.0
         self._active_flags.clear()
@@ -473,11 +532,10 @@ class PoseTracker:
             "hint": "Tracking — go.",
         }
 
-    @staticmethod
-    def _depth_state(angle: float) -> str:
-        if angle <= TARGET_DEPTH_DEG:
+    def _depth_state(self, angle: float) -> str:
+        if angle <= self.target_depth_deg:
             return "below_parallel"
-        if angle <= PARALLEL_DEG:
+        if angle <= self.parallel_deg:
             return "at_parallel"
         return "shallow"
 
@@ -541,7 +599,7 @@ class PoseTracker:
         depth_std = self._stddev(depths)
         depth_min = min(depths) if depths else 0.0
         depth_max = max(depths) if depths else 0.0
-        reps_at_target = sum(1 for d in depths if d <= TARGET_DEPTH_DEG)
+        reps_at_target = sum(1 for d in depths if d <= self.target_depth_deg)
         hit_rate = reps_at_target / len(depths) if depths else 0.0
 
         depth_trend, depth_delta = self._trend(
@@ -615,7 +673,7 @@ class PoseTracker:
             "reps_completed": c.rep_count,
             "rep_target": self.rep_target,
             "rep_depths_deg": depths,
-            "target_depth_deg": TARGET_DEPTH_DEG,
+            "target_depth_deg": self.target_depth_deg,
             "depth_trend": legacy_depth_trend,
             "form_flag_counts": dict(c.flag_counts),
             "fatigue_signal": fatigue_label,
@@ -629,7 +687,7 @@ class PoseTracker:
                     "stddev_deg": round(depth_std, 1),
                     "min_deg": round(depth_min, 1),
                     "max_deg": round(depth_max, 1),
-                    "target_deg": TARGET_DEPTH_DEG,
+                    "target_deg": self.target_depth_deg,
                     "reps_at_or_below_target": reps_at_target,
                     "target_hit_rate": round(hit_rate, 2),
                     "trend": depth_trend,
@@ -664,6 +722,11 @@ class PoseTracker:
                 },
             },
             "templated_debrief": templated,
+            # Active PT profile + AI debrief slot. `ai_debrief` is filled
+            # asynchronously after the summary is emitted; null on first
+            # emission and stays null if Gemini errors / no key.
+            "profile": self.profile.to_dict(),
+            "ai_debrief": None,
         }
 
     def _build_notes(
@@ -677,11 +740,11 @@ class PoseTracker:
             return notes
         notes.append(
             f"Average knee angle at bottom was {depth_mean:.0f}° "
-            f"(target {TARGET_DEPTH_DEG}°)."
+            f"(target {self.target_depth_deg:.0f}°)."
         )
         notes.append(
             f"{int(hit_rate * 100)}% of reps reached the target depth "
-            f"({sum(1 for d in depths if d <= TARGET_DEPTH_DEG)} of {len(depths)})."
+            f"({sum(1 for d in depths if d <= self.target_depth_deg)} of {len(depths)})."
         )
         if depth_trend == "declining_late":
             notes.append(
@@ -713,7 +776,7 @@ class PoseTracker:
             )
         if fast_idx:
             notes.append(
-                f"{len(fast_idx)} rep(s) faster than {FAST_REP_SEC}s: "
+                f"{len(fast_idx)} rep(s) faster than {self.fast_rep_sec:.1f}s: "
                 f"rep {', '.join(str(i) for i in fast_idx)}."
             )
         if ec_ratio_mean > 0:
@@ -745,7 +808,7 @@ class PoseTracker:
         lines: list[str] = []
         lines.append(
             f"Completed {reps} of {rep_target} reps. Average depth {depth_mean:.0f}° "
-            f"({int(hit_rate * 100)}% of reps at or below target {TARGET_DEPTH_DEG}°)."
+            f"({int(hit_rate * 100)}% of reps at or below target {self.target_depth_deg:.0f}°)."
         )
         if depth_trend == "declining_late":
             lines.append(
@@ -962,7 +1025,37 @@ class PoseTracker:
                 self.on_set_end(summary)
             except Exception as e:
                 print(f"[pose_tracker] on_set_end error: {e}")
+            # Async Gemini call so the frame loop doesn't block 1-3s on it.
+            self._spawn_ai_debrief(summary, self.profile)
             self.phase = "DEBRIEF"
+
+    def _spawn_ai_debrief(self, summary: dict, profile: PTProfile) -> None:
+        """Run the AI debrief Gemini call on a daemon thread.
+
+        Fires `on_ai_debrief(text)` when the call succeeds. Silent if Gemini
+        is unavailable — the UI still has `summary.templated_debrief` as the
+        always-on fallback (reliability rule, CONTEXT §8).
+        """
+        import threading
+
+        def _work():
+            try:
+                # Local import so a missing google-generativeai install
+                # doesn't break import-time of pose_tracker.
+                from ai_agent import generate_debrief
+                text = generate_debrief(profile, summary)
+            except Exception as e:
+                print(f"[pose_tracker] ai_debrief error: {e}")
+                return
+            if not text:
+                return
+            try:
+                self.on_ai_debrief(text)
+            except Exception as e:
+                print(f"[pose_tracker] on_ai_debrief callback error: {e}")
+
+        t = threading.Thread(target=_work, daemon=True, name="ai-debrief")
+        t.start()
 
     def _emit_state(
         self, *, angle: Optional[float], tracking_source: str,
@@ -995,6 +1088,7 @@ class PoseTracker:
             "tracking_source": tracking_source,
             "rep_depths": list(self.counter.rep_depths),
             "setup_status": setup_status,
+            "profile": self.profile.to_dict(),
         }
         try:
             self.on_state(state)
