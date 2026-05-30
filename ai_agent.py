@@ -156,6 +156,70 @@ def parse_prescription(text: str) -> Optional[PTProfile]:
         return None
 
 
+_SESSION_REPORT_PROMPT_TEMPLATE = """You are a physical therapist writing a brief progress note for your patient's chart.
+Audience is the CLINICIAN at the next visit, NOT the patient. No medical advice.
+
+From the patient's profile and the sequence of completed sets below, give:
+- A 2-4 sentence summary of how the session went.
+- Adherence (did they hit the prescribed reps and depth?).
+- Depth trend across sets (improving, holding, declining).
+- Fatigue pattern (early, late, none).
+- One concrete recommended focus for the next visit.
+
+PROFILE:
+{profile_json}
+
+SETS (oldest first):
+{sets_json}
+"""
+
+
+def generate_session_report(profile: PTProfile, set_rows: list[dict]) -> Optional[str]:
+    """Synthesize a clinician-facing progress note across all sets in a session.
+
+    `set_rows` is a list of per-set summaries (or BQ row dicts) — anything with
+    the standard summary fields will do. Returns None on missing key, no rows,
+    or API error; caller can show a rule-based fallback instead.
+    """
+    if not set_rows:
+        return None
+    genai = _client()
+    if genai is None:
+        return None
+    try:
+        # Compact each set down to the fields that matter for trend analysis.
+        compact = []
+        for r in set_rows:
+            analysis = r.get("analysis") or {}
+            depth = analysis.get("depth") or {}
+            tempo = analysis.get("tempo") or {}
+            compact.append({
+                "set_index":         r.get("set_index"),
+                "reps_completed":    r.get("reps_completed", r.get("reps")),
+                "rep_target":        r.get("rep_target"),
+                "avg_depth_deg":     depth.get("mean_deg", r.get("avg_depth_deg")),
+                "min_depth_deg":     depth.get("min_deg",  r.get("min_depth_deg")),
+                "target_hit_rate":   depth.get("target_hit_rate"),
+                "depth_trend":       depth.get("trend"),
+                "tempo_mean_sec":    tempo.get("mean_sec"),
+                "tempo_trend":       tempo.get("trend"),
+                "fatigue_signal":    r.get("fatigue_signal"),
+            })
+        prompt = _SESSION_REPORT_PROMPT_TEMPLATE.format(
+            profile_json=json.dumps(profile.to_dict(), indent=2),
+            sets_json=json.dumps(compact, indent=2)[:6000],
+        )
+        model = genai.GenerativeModel(GEMINI_MODEL)
+        response = model.generate_content(prompt)
+        text = (response.text or "").strip()
+    except Exception as e:
+        print(f"[ai_agent] generate_session_report error: {e}")
+        return None
+    if not text:
+        return None
+    return text[:DEBRIEF_CHAR_CAP * 2]  # ~ paragraph
+
+
 def generate_debrief(profile: PTProfile, summary: dict) -> Optional[str]:
     """Produce a 3-5 sentence clinical debrief tailored to the profile.
 

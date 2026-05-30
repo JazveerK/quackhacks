@@ -246,6 +246,89 @@ message so all clients update their displays. No need to refetch.
 Returns the current active profile (same shape as the WS `profile` message).
 Useful for an initial fetch if you don't want to wait for the WS replay.
 
+### HTTP — `GET /session`
+
+Live session metadata + in-memory list of this session's set summaries
+(no BigQuery read-after-write delay). Useful for the live debrief panel
+and any "session so far" display.
+
+Response:
+```json
+{
+  "session_id": "537e48b1",
+  "user_id": "demo_user",
+  "started_at": "2026-05-30T20:00:00+00:00",
+  "sets_count": 2,
+  "set_index": 2,
+  "summaries": [/* full per-set 4d summary objects, oldest first */],
+  "bq_available": true,
+  "gemini_available": true
+}
+```
+
+### HTTP — `POST /session/end`
+
+Finalizes the current session: writes the `sessions` row to BigQuery,
+calls Gemini for a PT-facing progress report (clinical voice, audience
+is the clinician), then rotates to a fresh session_id so subsequent sets
+start clean.
+
+Response:
+```json
+{
+  "session_id": "537e48b1",
+  "user_id": "demo_user",
+  "sets_count": 3,
+  "total_reps": 22,
+  "avg_depth": 96.4,
+  "adherence_flag": "complete" | "partial",
+  "report": "Sam completed 3 sets of bodyweight squats today. Depth held in the first two sets and softened in the third...",
+}
+```
+
+`report` is null if Gemini is unavailable. Safe to call with zero sets —
+returns `report: null, reason: "no sets in this session"` and rotates the
+session_id.
+
+### HTTP — `GET /sets/recent?limit=50`
+
+PT view trends. Returns the most recent N rows from the BigQuery `sets`
+table across all sessions, latest first.
+
+Response:
+```json
+{
+  "rows": [
+    {
+      "session_id": "537e48b1", "set_index": 3,
+      "reps": 6, "avg_depth_deg": 96.4, "min_depth_deg": 92,
+      "fatigue_score": 0.5,
+      "debrief_text": "...",
+      "recommended_next": "drop 2 reps; focus depth"
+    },
+    ...
+  ],
+  "bq_available": true
+}
+```
+Returns an empty `rows` list if BQ isn't configured — fall back to
+`/session.summaries` for the live demo.
+
+### Auth notes for whoever runs the server
+
+`GEMINI_API_KEY` is required for the AI debrief + prescription parse +
+session report. Set it in the environment of the process running `run.py`.
+
+For BigQuery on a laptop (not Cloud Shell), run once:
+```
+gcloud auth application-default login
+```
+Then `bigquery.Client()` finds the project. The dataset is
+`PF_BQ_DATASET` (default `physiofusion`) — change via env if needed.
+
+`GET /session` exposes `bq_available` and `gemini_available` booleans so
+the UI can show a corner badge ("Google services: connected").
+
 ---
 
 ## Field semantics (the tricky bits)

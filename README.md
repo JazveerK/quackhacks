@@ -20,7 +20,8 @@ QuackHacks 3 (24h hackathon). Three-agent team.
 |---|---|---|
 | `pose_tracker.py` | Agent B | Done — pose tracking + fusion + rep state machine + 4c/4d + setup hints + profile-driven targets |
 | `profile.py` | Agent B | Done — `PTProfile` dataclass + Sam (post-ACL) default |
-| `ai_agent.py` | Agent B | Done — Gemini Flash wrappers (prescription parse + clinical debrief) |
+| `ai_agent.py` | Agent B | Done — Gemini Flash wrappers (prescription parse + clinical debrief + session report) |
+| `bq.py` | Agent B | Done — BigQuery persistence (set + session writes, recent reads) |
 | `mock_state.py` | (shared) | Done — fake 4c stream + 4d summary including profile + ai_debrief |
 | `smoke.py` | Agent B | Done — backend assertions (counter, profile binding, setup classifier) |
 | `run.py` | Agent B | Done — standalone launcher (mac webcam pre-flight) |
@@ -35,6 +36,18 @@ QuackHacks 3 (24h hackathon). Three-agent team.
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
+
+### Google services (Gemini + BigQuery)
+
+```bash
+export GEMINI_API_KEY="AIza..."          # AI Studio key
+gcloud auth application-default login    # one-time, for BigQuery on the laptop
+export PF_BQ_DATASET="physiofusion"      # optional; this is the default
+```
+
+Both Gemini and BigQuery degrade gracefully without these — the demo runs
+either way. With them set, the AI debrief is spoken at set end, the
+prescription upload works, and every set is persisted to BigQuery.
 
 ### No camera / no hardware (develop the dashboard)
 ```bash
