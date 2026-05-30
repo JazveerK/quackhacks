@@ -238,6 +238,7 @@ async def index():
 
 
 if STATIC_DIR.exists():
+    app.mount("/assets", StaticFiles(directory=str(STATIC_DIR / "assets")), name="assets")
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 

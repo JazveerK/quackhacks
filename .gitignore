@@ -11,8 +11,12 @@ __pycache__/
 
 # OS / IDE
 .DS_Store
+._*
 .idea/
 .vscode/
+
+# Frontend build deps
+frontend/node_modules/
 
 # Claude Code internals
 .claude/
