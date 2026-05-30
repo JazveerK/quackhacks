@@ -19,7 +19,9 @@ import base64
 import json
 import os
 import threading
+import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
@@ -30,6 +32,7 @@ from pydantic import BaseModel
 from pose_tracker import PoseTracker, MockIMU
 from profile import PTProfile, DEFAULT_PROFILE
 import ai_agent
+import bq
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -107,13 +110,56 @@ tracker_thread: threading.Thread | None = None
 clients: set[WebSocket] = set()
 
 
+# ---------------------------------------------------------------------------
+# Session / set tracking. session_id is generated when the server starts;
+# set_index increments on each completed set. In-memory list of this
+# session's summaries powers the session-end PT report without re-querying
+# BigQuery (which has read-after-write delay).
+# ---------------------------------------------------------------------------
+SESSION_ID = uuid.uuid4().hex[:8]
+SESSION_STARTED_AT = datetime.now(timezone.utc)
+SESSION_USER_ID = os.environ.get("PF_USER_ID", "demo_user")
+set_index = 0
+session_summaries: list[dict] = []
+_session_lock = threading.Lock()
+
+
+def _new_session() -> None:
+    """Reset to a fresh session_id + counters. Called by POST /session/end
+    after the closing session row is written."""
+    global SESSION_ID, SESSION_STARTED_AT, set_index, session_summaries
+    with _session_lock:
+        SESSION_ID = uuid.uuid4().hex[:8]
+        SESSION_STARTED_AT = datetime.now(timezone.utc)
+        set_index = 0
+        session_summaries = []
+
+
+def _on_set_end(summary: dict) -> None:
+    """Tag, persist (BigQuery, best-effort), broadcast."""
+    global set_index
+    with _session_lock:
+        set_index += 1
+        summary["session_id"] = SESSION_ID
+        summary["set_index"] = set_index
+        session_summaries.append(summary)
+        sid, sidx = SESSION_ID, set_index
+    # Storage: best-effort, never fatal.
+    threading.Thread(
+        target=bq.insert_set,
+        args=(sid, sidx, summary),
+        daemon=True, name="bq-insert-set",
+    ).start()
+    bridge.push_set_summary(summary)
+
+
 def _start_tracker() -> None:
     global tracker, tracker_thread
     camera_index = int(os.environ.get("PF_CAMERA", "0"))
     tracker = PoseTracker(
         imu_source=MockIMU(),
         on_state=bridge.push_state,
-        on_set_end=bridge.push_set_summary,
+        on_set_end=_on_set_end,
         on_frame=bridge.push_frame,
         on_ai_debrief=bridge.push_ai_debrief,
         camera_index=camera_index,
@@ -237,6 +283,95 @@ async def get_profile():
         return JSONResponse({"profile": DEFAULT_PROFILE.to_dict(), "source": "default"})
     return JSONResponse({"profile": tracker.profile.to_dict(),
                          "source": tracker.profile.source})
+
+
+# ---------------------------------------------------------------------------
+# Session lifecycle + BigQuery-backed PT view.
+# ---------------------------------------------------------------------------
+@app.get("/session")
+async def get_session():
+    """Current session metadata + in-memory set summaries (live, no BQ delay)."""
+    with _session_lock:
+        return JSONResponse({
+            "session_id": SESSION_ID,
+            "user_id": SESSION_USER_ID,
+            "started_at": SESSION_STARTED_AT.isoformat(),
+            "sets_count": len(session_summaries),
+            "set_index": set_index,
+            "summaries": list(session_summaries),
+            "bq_available": bq.is_available(),
+            "gemini_available": bool(os.environ.get("GEMINI_API_KEY", "").strip()),
+        })
+
+
+@app.post("/session/end")
+async def end_session():
+    """Finalize the current session: write the session row to BigQuery, call
+    Gemini for a PT-facing progress report, then rotate to a fresh session.
+
+    Returns the PT report text (or None) plus the aggregates. Safe to call
+    with zero sets — just resets the counter.
+    """
+    with _session_lock:
+        sid = SESSION_ID
+        started_at = SESSION_STARTED_AT
+        user_id = SESSION_USER_ID
+        summaries = list(session_summaries)
+    if not summaries:
+        _new_session()
+        return JSONResponse({
+            "session_id": sid, "sets_count": 0, "total_reps": 0,
+            "report": None, "reason": "no sets in this session",
+        })
+
+    sets_count = len(summaries)
+    total_reps = sum(int(s.get("reps_completed", 0)) for s in summaries)
+    depths = []
+    for s in summaries:
+        rd = s.get("rep_depths_deg") or []
+        depths.extend(rd)
+    avg_depth = round(sum(depths) / len(depths), 1) if depths else 0.0
+    # Adherence: did every set hit its rep target?
+    all_targets_hit = all(
+        int(s.get("reps_completed", 0)) >= int(s.get("rep_target", 0))
+        for s in summaries
+    )
+    adherence_flag = "complete" if all_targets_hit else "partial"
+
+    # Write the session row (best-effort).
+    bq.insert_session(
+        session_id=sid, user_id=user_id, started_at=started_at,
+        sets_count=sets_count, total_reps=total_reps,
+        avg_depth=avg_depth, adherence_flag=adherence_flag,
+    )
+
+    # Gemini progress report (gracefully degrades to None).
+    active_profile = tracker.profile if tracker is not None else DEFAULT_PROFILE
+    report = ai_agent.generate_session_report(active_profile, summaries)
+
+    # Rotate to a fresh session_id so subsequent sets start clean.
+    _new_session()
+
+    return JSONResponse({
+        "session_id": sid,
+        "user_id": user_id,
+        "sets_count": sets_count,
+        "total_reps": total_reps,
+        "avg_depth": avg_depth,
+        "adherence_flag": adherence_flag,
+        "report": report,
+    })
+
+
+@app.get("/sets/recent")
+async def sets_recent(limit: int = 50):
+    """Most recent N sets from BigQuery, latest first. Powers View B trends.
+
+    Returns an empty list if BQ isn't configured — the UI can fall back to
+    the in-memory `/session` summaries.
+    """
+    rows = bq.query_recent_sets(limit=max(1, min(int(limit), 500)))
+    return JSONResponse({"rows": rows, "bq_available": bq.is_available()})
 
 
 # ---------------------------------------------------------------------------

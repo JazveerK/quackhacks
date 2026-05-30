@@ -168,7 +168,25 @@ or times out (per reliability rule, section 8).
 ### 4e. BigQuery tables
 - `sets(session_id, set_index, reps, avg_depth_deg, min_depth_deg, fatigue_score, debrief_text, recommended_next)`
 - `sessions(session_id, user_id, exercise, started_at, sets_count, total_reps, avg_depth, adherence_flag)`
+
 Write a `sets` row at each set end; a `sessions` row at session end. PT view reads these.
+
+`bq.py` exposes:
+- `insert_set(session_id, set_index, summary)` — writes a row from a 4d summary
+- `insert_session(...)` — closes a session
+- `query_recent_sets(limit)` / `query_session_sets(session_id)` — PT view reads
+
+All BQ functions fail closed: missing credentials, missing tables, or any
+exception logs a warning and returns False / []. The live demo never crashes
+on storage problems.
+
+**Laptop auth.** Cloud Shell is auto-authed, but the live backend runs on the
+laptop the Arduino is plugged into. Run once on the laptop:
+```
+gcloud auth application-default login
+```
+Then `bigquery.Client()` finds the project. The dataset name comes from
+env `PF_BQ_DATASET` (default `physiofusion`).
 
 ## 5. Components & ownership (one agent each)
 

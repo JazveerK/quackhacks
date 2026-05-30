@@ -517,6 +517,73 @@ def t22_summary_has_ai_debrief_slot():
 
 
 # ---------------------------------------------------------------------------
+# BigQuery — fail-closed behavior without Application Default Credentials.
+# ---------------------------------------------------------------------------
+def t23_bq_no_auth_is_silent():
+    print("\n[23] bq: without Application Default Credentials -> falsy, no exception")
+    import bq
+    # Reset memoization in case prior tests / imports cached a client.
+    bq._client = None
+    bq._init_attempted = False
+    available = bq.is_available()
+    inserted = bq.insert_set("s1", 1, {"rep_depths_deg": [90, 92, 88]})
+    rows = bq.query_recent_sets(limit=5)
+    # Either auth is configured (Cloud Shell, or `gcloud auth application-default
+    # login` already ran) and writes/reads work, or it isn't and we get the
+    # graceful fallback. Both are valid; we only assert "no exception, no crash".
+    check("is_available returned a bool", isinstance(available, bool),
+          "bool", type(available).__name__)
+    check("insert_set returned a bool", isinstance(inserted, bool),
+          "bool", type(inserted).__name__)
+    check("query_recent_sets returned a list", isinstance(rows, list),
+          "list", type(rows).__name__)
+
+
+def t24_bq_fatigue_score_mapping():
+    print("\n[24] bq._fatigue_score maps fatigue_signal labels deterministically")
+    import bq
+    cases = [
+        ("none", 0.0), ("depth_decline", 0.5),
+        ("tempo_decline", 0.5), ("both", 1.0), ("garbage", 0.0),
+    ]
+    for sig, expected in cases:
+        got = bq._fatigue_score({"fatigue_signal": sig})
+        check(f"{sig!r} -> {expected}", got == expected, expected, got)
+
+
+def t25_bq_next_recommendation_uses_analysis():
+    print("\n[25] bq._next_recommendation reads from analysis trend fields")
+    import bq
+    s1 = {"analysis": {"depth": {"trend": "declining_late", "target_hit_rate": 0.6},
+                       "tempo": {"trend": "consistent"}}}
+    s2 = {"analysis": {"depth": {"trend": "consistent", "target_hit_rate": 0.5},
+                       "tempo": {"trend": "slowing_down"}}}
+    s3 = {"analysis": {"depth": {"trend": "consistent", "target_hit_rate": 0.95},
+                       "tempo": {"trend": "consistent"}}}
+    check("declining_late -> drop reps", "drop 2 reps" in bq._next_recommendation(s1),
+          "drop 2 reps...", bq._next_recommendation(s1))
+    check("slowing_down -> drop tempo", "drop tempo" in bq._next_recommendation(s2),
+          "drop tempo...", bq._next_recommendation(s2))
+    check("on-target -> hold/add", "hold" in bq._next_recommendation(s3),
+          "hold...", bq._next_recommendation(s3))
+
+
+def t26_session_report_no_key_is_silent():
+    print("\n[26] ai_agent.generate_session_report: no key -> None")
+    import os, ai_agent
+    from profile import DEFAULT_PROFILE
+    saved = os.environ.pop("GEMINI_API_KEY", None)
+    try:
+        out = ai_agent.generate_session_report(DEFAULT_PROFILE, [{"reps_completed": 8}])
+        check("None when no key", out is None, None, out)
+        empty = ai_agent.generate_session_report(DEFAULT_PROFILE, [])
+        check("None when no rows", empty is None, None, empty)
+    finally:
+        if saved is not None:
+            os.environ["GEMINI_API_KEY"] = saved
+
+
+# ---------------------------------------------------------------------------
 # Main.
 # ---------------------------------------------------------------------------
 def main() -> int:
@@ -534,7 +601,10 @@ def main() -> int:
                t16_setup_front_view, t17_setup_ok,
                t18_profile_drives_thresholds, t19_depth_state_follows_profile,
                t20_set_profile_is_queued_until_reset,
-               t21_ai_agent_no_key_is_silent, t22_summary_has_ai_debrief_slot):
+               t21_ai_agent_no_key_is_silent, t22_summary_has_ai_debrief_slot,
+               t23_bq_no_auth_is_silent, t24_bq_fatigue_score_mapping,
+               t25_bq_next_recommendation_uses_analysis,
+               t26_session_report_no_key_is_silent):
         fn()
     print("=" * 72)
     passed = sum(results)
