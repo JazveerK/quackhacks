@@ -9,6 +9,9 @@ export default defineConfig({
     emptyOutDir: true,
   },
   server: {
+    fs: {
+      allow: ['..'],
+    },
     proxy: {
       '/ws': {
         target: 'http://127.0.0.1:8000',
@@ -18,6 +21,10 @@ export default defineConfig({
       '/profile': 'http://127.0.0.1:8000',
       '/coach': 'http://127.0.0.1:8000',
       '/session': 'http://127.0.0.1:8000',
+      '/api/share': 'http://127.0.0.1:8000',
+      '/share': 'http://127.0.0.1:8000',
+      '/user-context': 'http://127.0.0.1:8000',
+      '/sets': 'http://127.0.0.1:8000',
     },
     // Move Vite's own HMR websocket off /ws to avoid collision
     hmr: {

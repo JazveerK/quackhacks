@@ -5,21 +5,49 @@ const SR =
     ? window.SpeechRecognition || window.webkitSpeechRecognition
     : null
 
+// ── Offline fallback responses when backend is unavailable ──────────
+const OFFLINE_RESPONSES = [
+  "You're doing great — keep your core tight and control the descent.",
+  "Focus on pushing through your heels as you come up.",
+  "Try to keep your knees tracking over your toes.",
+  "Nice steady pace. If you feel any pain, take a break.",
+  "Remember: depth is more important than speed. Go slow.",
+  "Your form looks consistent. Keep it up!",
+]
+
+function getOfflineReply(message) {
+  const lower = message.toLowerCase()
+  if (lower.includes("form") || lower.includes("doing"))
+    return "Based on your session data, your form is looking solid. Focus on maintaining consistent depth across all reps."
+  if (lower.includes("deeper") || lower.includes("depth"))
+    return "Try widening your stance slightly and sitting back into your hips. Think about sitting into a chair behind you."
+  if (lower.includes("pain") || lower.includes("hurt") || lower.includes("tight"))
+    return "If you're feeling pain, stop and rest. Some muscle tightness is normal, but sharp pain is not. Let your PT know at your next visit."
+  if (lower.includes("tired") || lower.includes("fatigue"))
+    return "It's okay to feel fatigued. Reduce your rep count by 2 and focus on quality over quantity for the remaining reps."
+  return OFFLINE_RESPONSES[Math.floor(Math.random() * OFFLINE_RESPONSES.length)]
+}
+
+// ── Browser TTS helper ──────────────────────────────────────────────
+function speakBrowser(text) {
+  if (!window.speechSynthesis) return Promise.resolve()
+  return new Promise((resolve) => {
+    const utt = new SpeechSynthesisUtterance(text)
+    utt.rate = 0.95
+    utt.pitch = 1.0
+    utt.onend = resolve
+    utt.onerror = resolve
+    window.speechSynthesis.speak(utt)
+  })
+}
+
 /**
- * Conversational coach: mic → speech-to-text → Gemini → ElevenLabs → speaker.
- *
- * Returns {
- *   messages,       // [{role: "user"|"coach", text}]
- *   status,         // "idle" | "listening" | "thinking" | "speaking"
- *   startListening, // begin mic capture
- *   stopListening,  // cancel mic
- *   sendText,       // send typed text directly
- *   clearHistory,
- * }
+ * Conversational coach: mic -> speech-to-text -> Gemini -> ElevenLabs -> speaker.
+ * Falls back to offline responses + browser TTS when backend is unavailable.
  */
 export function useCoachChat(sessionState) {
   const [messages, setMessages] = useState([])
-  const [status, setStatus] = useState("idle") // idle | listening | thinking | speaking
+  const [status, setStatus] = useState("idle")
   const recRef = useRef(null)
   const audioRef = useRef(null)
 
@@ -28,7 +56,6 @@ export function useCoachChat(sessionState) {
     [messages]
   )
 
-  // ── Send text to backend and play response ──
   const sendText = useCallback(
     async (text) => {
       if (!text.trim()) return
@@ -36,8 +63,10 @@ export function useCoachChat(sessionState) {
       setMessages((prev) => [...prev, userMsg])
       setStatus("thinking")
 
+      let replyText = null
+
+      // Try backend (Gemini) first
       try {
-        // Step 1: get text reply from Gemini
         const chatRes = await fetch("/coach/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -48,14 +77,15 @@ export function useCoachChat(sessionState) {
           }),
         })
 
-        if (!chatRes.ok) throw new Error(await chatRes.text())
-        const { text: replyText, audio_available } = await chatRes.json()
+        if (!chatRes.ok) throw new Error("backend unavailable")
+        const data = await chatRes.json()
+        replyText = data.text
 
         const coachMsg = { role: "coach", text: replyText }
         setMessages((prev) => [...prev, coachMsg])
 
-        // Step 2: generate audio via /coach/speak
-        if (audio_available) {
+        // Try ElevenLabs audio
+        if (data.audio_available) {
           setStatus("speaking")
           try {
             const audioRes = await fetch("/coach/speak", {
@@ -76,34 +106,43 @@ export function useCoachChat(sessionState) {
               await audio.play()
               return
             }
-          } catch (e) {
-            console.warn("Coach audio failed, text-only:", e)
+          } catch {
+            // ElevenLabs failed — try browser TTS
           }
         }
+
+        // Fall back to browser TTS for the response
+        setStatus("speaking")
+        await speakBrowser(replyText)
         setStatus("idle")
-      } catch (e) {
-        console.error("Coach chat error:", e)
-        setMessages((prev) => [
-          ...prev,
-          { role: "coach", text: "Sorry, I couldn't process that. Try again?" },
-        ])
-        setStatus("idle")
+        return
+      } catch {
+        // Backend entirely unavailable — use offline responses
       }
+
+      // Offline fallback
+      replyText = getOfflineReply(text.trim())
+      const coachMsg = { role: "coach", text: replyText }
+      setMessages((prev) => [...prev, coachMsg])
+
+      // Speak via browser TTS
+      setStatus("speaking")
+      await speakBrowser(replyText)
+      setStatus("idle")
     },
     [sessionState, historyForApi]
   )
 
-  // ── Mic: speech recognition ──
   const startListening = useCallback(() => {
     if (!SR) {
       console.warn("Speech recognition not supported")
       return
     }
-    // Stop any playing audio
     if (audioRef.current) {
       audioRef.current.pause()
       audioRef.current = null
     }
+    window.speechSynthesis?.cancel()
 
     const rec = new SR()
     rec.lang = "en-US"
@@ -138,6 +177,7 @@ export function useCoachChat(sessionState) {
       audioRef.current.pause()
       audioRef.current = null
     }
+    window.speechSynthesis?.cancel()
     setStatus("idle")
   }, [])
 

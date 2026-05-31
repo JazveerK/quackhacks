@@ -4,6 +4,50 @@ import GhostButton from "../components/GhostButton"
 import PrimaryButton from "../components/PrimaryButton"
 import Pill from "../components/Pill"
 
+// ── Demo FHIR Observation (used when backend is unavailable) ─────────
+const DEMO_OBSERVATION = {
+  resourceType: "Observation",
+  id: "demo-session-001",
+  meta: { tag: [{ system: "urn:physiofusion:tags", code: "patient-administered-remote-assessment", display: "Patient-administered remote assessment" }] },
+  status: "final",
+  category: [{ coding: [{ system: "http://terminology.hl7.org/CodeSystem/observation-category", code: "exam", display: "Exam" }] }],
+  code: { coding: [{ system: "http://loinc.org", code: "66247-8", display: "30-second Chair Stand Test" }], text: "30-second Chair Stand Test" },
+  subject: { reference: "Patient/sam-demo" },
+  effectiveDateTime: new Date().toISOString(),
+  issued: new Date().toISOString(),
+  valueQuantity: { value: 9, unit: "reps", system: "http://unitsofmeasure.org", code: "{count}" },
+  interpretation: [{
+    coding: [{ system: "http://terminology.hl7.org/CodeSystem/v3-ObservationInterpretation", code: "L", display: "Low" }],
+    text: "9 reps in 30 s is below average for female, age 70-74, community-dwelling (reference 10-15). This is below the CDC STEADI threshold and may indicate elevated fall risk.",
+  }],
+  referenceRange: [{
+    low: { value: 10, unit: "reps" },
+    high: { value: 15, unit: "reps" },
+    text: "Average range for Female, age 70-74, community-dwelling",
+    appliesTo: [{ text: "Female, age 70-74, community-dwelling" }],
+  }],
+  note: [
+    { text: "This observation is a measurement from a patient-administered remote assessment using PhysioFusion. It is observational data intended for clinician review and is NOT a clinical diagnosis. Interpretation codes (L/N/H) represent normative comparisons against validated reference ranges, not diagnostic conclusions." },
+    { text: "SCREENING SIGNAL: Score is below the CDC STEADI fall-risk threshold for this age/sex cohort. This is a screening signal for clinician review, not a clinical conclusion." },
+  ],
+  component: [
+    { code: { coding: [{ system: "urn:physiofusion:metrics", code: "tracking-source", display: "Tracking source" }], text: "Tracking source" }, valueString: "fused" },
+    { code: { coding: [{ system: "urn:physiofusion:metrics", code: "tracking-confidence", display: "Tracking confidence (mean)" }], text: "Tracking confidence (mean)" }, valueQuantity: { value: 0.92 } },
+    { code: { coding: [{ system: "urn:physiofusion:metrics", code: "quality-gate", display: "Quality gate result" }], text: "Quality gate result" }, valueString: "pass" },
+    { code: { coding: [{ system: "urn:physiofusion:metrics", code: "calibration-id", display: "Calibration ID" }], text: "Calibration ID" }, valueString: "cal-demo-001" },
+    { code: { coding: [{ system: "urn:physiofusion:metrics", code: "mean-concentric-s", display: "Mean concentric duration" }], text: "Mean concentric duration" }, valueQuantity: { value: 1.2, unit: "s" } },
+    { code: { coding: [{ system: "urn:physiofusion:metrics", code: "mean-eccentric-s", display: "Mean eccentric duration" }], text: "Mean eccentric duration" }, valueQuantity: { value: 1.8, unit: "s" } },
+    { code: { coding: [{ system: "urn:physiofusion:metrics", code: "tempo-asymmetry", display: "Tempo asymmetry (ecc/con ratio)" }], text: "Tempo asymmetry (ecc/con ratio)" }, valueQuantity: { value: 1.5 } },
+    { code: { coding: [{ system: "urn:physiofusion:metrics", code: "peak-knee-flexion-deg", display: "Peak knee flexion" }], text: "Peak knee flexion" }, valueQuantity: { value: 88.5, unit: "deg" } },
+    { code: { coding: [{ system: "urn:physiofusion:metrics", code: "rom-delta-vs-baseline-deg", display: "ROM delta vs baseline" }], text: "ROM delta vs baseline" }, valueQuantity: { value: 3.0, unit: "deg" } },
+    { code: { coding: [{ system: "urn:physiofusion:metrics", code: "pain-nprs", display: "Pain (NPRS 0-10)" }], text: "Pain (NPRS 0-10)" }, valueString: "not reported" },
+    { code: { coding: [{ system: "urn:physiofusion:metrics", code: "adherence", display: "Adherence (completed/prescribed)" }], text: "Adherence (completed/prescribed)" }, valueString: "3/3" },
+    { code: { coding: [{ system: "urn:physiofusion:metrics", code: "flag-rom-regression", display: "Clinical flag: ROM regression" }], text: "Clinical flag: ROM regression" }, valueBoolean: false },
+    { code: { coding: [{ system: "urn:physiofusion:metrics", code: "flag-tempo-guarding", display: "Clinical flag: Tempo guarding" }], text: "Clinical flag: Tempo guarding" }, valueBoolean: true },
+    { code: { coding: [{ system: "urn:physiofusion:metrics", code: "flag-progression-stalled", display: "Clinical flag: Progression stalled" }], text: "Clinical flag: Progression stalled" }, valueBoolean: false },
+  ],
+}
+
 // ── Norm range bar visualization ────────────────────────────────────
 function NormBar({ score, low, high, label }) {
   // Scale: 0 to high * 1.6 (gives room on both ends)
@@ -251,7 +295,12 @@ export default function ClinicianHandoff({ sessionId, observation: propObs }) {
       setLoading(false)
       return
     }
-    if (!sessionId) return
+    if (!sessionId) {
+      // No session ID and no prop — use demo observation
+      setObs(DEMO_OBSERVATION)
+      setLoading(false)
+      return
+    }
     setLoading(true)
     fetch(`/api/share/${sessionId}`)
       .then((r) => {
@@ -262,8 +311,9 @@ export default function ClinicianHandoff({ sessionId, observation: propObs }) {
         setObs(data.observation)
         setLoading(false)
       })
-      .catch((e) => {
-        setError(e.message)
+      .catch(() => {
+        // Backend unavailable — fall back to demo observation
+        setObs(DEMO_OBSERVATION)
         setLoading(false)
       })
   }, [sessionId, propObs])

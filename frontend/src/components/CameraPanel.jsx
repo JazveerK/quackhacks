@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useEffect } from "react"
+import { useState, useRef, useCallback } from "react"
 import GhostButton from "./GhostButton"
 import PoseMatchOverlay from "../coach/PoseMatchOverlay"
 
@@ -18,9 +18,6 @@ export default function CameraPanel({ frame, repDepths, targetDeg, landmarks }) 
   const depths = repDepths || []
   const atTarget = depths.filter(d => d <= target + 5).length
 
-  // DEV-ONLY: Local webcam preview. Must not run while the backend owns the
-  // camera (single-process camera lock). Use only for front-end development
-  // when the backend is not running.
   const toggleWebcam = useCallback(async () => {
     if (webcamActive) {
       streamRef.current?.getTracks().forEach((t) => t.stop())
@@ -42,22 +39,22 @@ export default function CameraPanel({ frame, repDepths, targetDeg, landmarks }) 
 
   return (
     <div
-      className="relative bg-ink rounded-2xl overflow-hidden flex items-center justify-center h-full min-h-[300px]"
+      className="relative bg-[#1a1a1a] rounded-2xl overflow-hidden flex items-center justify-center h-full"
       role="img"
       aria-label="Live camera feed showing squat exercise with pose skeleton overlay"
     >
-      {/* Top-left label */}
-      <span className="absolute top-4 left-4 text-[12px] text-white/60 tracking-wide z-10 bg-black/20 backdrop-blur-sm px-3 py-1.5 rounded-lg">
-        Camera · side view
-      </span>
+      {/* Top bar — label + live indicator */}
+      <div className="absolute top-0 left-0 right-0 z-10 flex items-center justify-between px-4 py-3">
+        <span className="text-[12px] text-white/50 tracking-wide bg-black/30 backdrop-blur-sm px-3 py-1.5 rounded-lg font-medium">
+          Camera · side view
+        </span>
+        <span className="flex items-center gap-2 text-[12px] text-white/70 bg-black/30 backdrop-blur-sm px-3 py-1.5 rounded-lg font-medium">
+          <span className="w-2 h-2 rounded-full bg-ok animate-pulse motion-reduce:animate-none" />
+          Live
+        </span>
+      </div>
 
-      {/* Top-right live indicator */}
-      <span className="absolute top-4 right-4 flex items-center gap-2 text-[12px] text-white/80 z-10 bg-black/20 backdrop-blur-sm px-3 py-1.5 rounded-lg">
-        <span className="w-2 h-2 rounded-full bg-ok animate-pulse motion-reduce:animate-none" />
-        Live
-      </span>
-
-      {/* Priority 1: MJPEG stream from backend */}
+      {/* Priority 1: MJPEG stream */}
       {showStream && (
         <img
           src={VIDEO_URL}
@@ -87,17 +84,23 @@ export default function CameraPanel({ frame, repDepths, targetDeg, landmarks }) 
         />
       )}
 
-      {/* Priority 4: Placeholder */}
+      {/* Priority 4: Placeholder with silhouette */}
       {showPlaceholder && (
-        <div className="flex flex-col items-center gap-3">
-          <div className="w-14 h-14 rounded-2xl bg-white/10 flex items-center justify-center">
-            <i className="ti ti-camera-off text-white/30 text-2xl" />
+        <div className="flex flex-col items-center gap-4">
+          <div className="relative w-24 h-24 rounded-full bg-white/5 flex items-center justify-center">
+            <i className="ti ti-yoga text-white/15 text-5xl" />
+            <div className="absolute -bottom-1 -right-1 w-8 h-8 rounded-full bg-white/10 flex items-center justify-center">
+              <i className="ti ti-camera text-white/30 text-sm" />
+            </div>
           </div>
-          <span className="text-[15px] text-white/40">Waiting for camera...</span>
+          <div className="text-center">
+            <div className="text-[14px] text-white/40 font-medium">Waiting for camera</div>
+            <div className="text-[12px] text-white/25 mt-1">Stand to the side, full body in frame</div>
+          </div>
         </div>
       )}
 
-      {/* Pose match overlay — renders skeleton + ghost when landmarks available */}
+      {/* Pose match overlay — skeleton + ghost */}
       {landmarks && landmarks.length >= 33 && (
         <PoseMatchOverlay
           landmarks={landmarks}
@@ -107,7 +110,7 @@ export default function CameraPanel({ frame, repDepths, targetDeg, landmarks }) 
         />
       )}
 
-      {/* Per-rep depth bars overlay (bottom edge of camera panel) */}
+      {/* Per-rep depth bars (bottom edge) */}
       {depths.length > 0 && (
         <div
           className="absolute bottom-0 left-0 right-0 z-10 px-5 pb-4 pt-10 bg-gradient-to-t from-black/60 to-transparent"
@@ -139,13 +142,24 @@ export default function CameraPanel({ frame, repDepths, targetDeg, landmarks }) 
       )}
 
       {/* DEV-ONLY webcam toggle */}
-      {!showStream && (
+      {!showStream && !webcamActive && (
         <div className="absolute bottom-4 right-4 z-20">
           <GhostButton
             onClick={toggleWebcam}
-            className="!text-[12px] !px-3 !py-1.5 !bg-black/30 !backdrop-blur-sm !text-white/60 hover:!text-white/90"
+            className="!text-[12px] !px-3 !py-1.5 !min-h-0 !bg-black/30 !backdrop-blur-sm !text-white/60 hover:!text-white/90"
           >
-            {webcamActive ? "Stop webcam" : "Use webcam preview"}
+            <i className="ti ti-camera text-[13px]" />
+            Preview webcam
+          </GhostButton>
+        </div>
+      )}
+      {!showStream && webcamActive && (
+        <div className="absolute bottom-4 right-4 z-20">
+          <GhostButton
+            onClick={toggleWebcam}
+            className="!text-[12px] !px-3 !py-1.5 !min-h-0 !bg-black/30 !backdrop-blur-sm !text-white/60 hover:!text-white/90"
+          >
+            Stop webcam
           </GhostButton>
         </div>
       )}

@@ -6,29 +6,50 @@ debrief, and a live web dashboard.
 
 QuackHacks 3 (24h hackathon). Three-agent team.
 
-## First read
+## Project structure
 
-- **[`CONTEXT.md`](CONTEXT.md)** — project brief + data contracts. Read first.
-- **[`HANDOFF_FRONTEND.md`](HANDOFF_FRONTEND.md)** — WebSocket / 4c / 4d contract reference
-  for the dashboard + Gemini wiring.
-- **[`HANDOFF_VOICE_IN.md`](HANDOFF_VOICE_IN.md)** — Web Speech API + "Hey coach"
-  + 4 commands brief for Agent C's voice input.
-
-## What's in the repo
-
-| File | Owner | Status |
-|---|---|---|
-| `pose_tracker.py` | Agent B | Done — pose tracking + fusion + rep state machine + 4c/4d + setup hints + profile-driven targets |
-| `profile.py` | Agent B | Done — `PTProfile` dataclass + Sam (post-ACL) default |
-| `ai_agent.py` | Agent B | Done — Gemini Flash wrappers (prescription parse + clinical debrief + session report) |
-| `bq.py` | Agent B | Done — BigQuery persistence (set + session writes, recent reads) |
-| `mock_state.py` | (shared) | Done — fake 4c stream + 4d summary including profile + ai_debrief |
-| `smoke.py` | Agent B | Done — backend assertions (counter, profile binding, setup classifier) |
-| `run.py` | Agent B | Done — standalone launcher (mac webcam pre-flight) |
-| `server.py` | Agent C | **Placeholder** — current file is a smoke server with upload + profile + ai_debrief broadcast wired. Agent C rewrites per CONTEXT.md §5 |
-| `static/index.html` | Agent C | **Placeholder** — minimal smoke UI. Agent C builds the real one |
-| `main.py` | (shared) | TODO — integration entry point. Wires Agent A's IMU + B's tracker + C's server |
-| `imu.py` | Agent A | TODO — real MPU6050 driver. `MockIMU` from `pose_tracker.py` is the stand-in |
+```
+quackhacks/
+├── docs/                       # All documentation
+│   ├── CONTEXT.md              # Project brief + data contracts (read first)
+│   ├── HANDOFF_FRONTEND.md     # WebSocket / 4c / 4d contract reference
+│   ├── HANDOFF_VOICE_IN.md     # Web Speech API + voice commands
+│   ├── frontend-spec.md        # Frontend UI/UX specification
+│   ├── pose-matching.md        # Pose matching overlay design
+│   ├── elevenlabs-coach-integration.md  # ElevenLabs TTS integration
+│   └── FEATURE_clinician_handoff.md     # FHIR clinician handoff feature
+│
+├── frontend/                   # React + Vite + Tailwind v4
+│   ├── src/
+│   │   ├── screens/            # Page-level components (CheckIn, Live, Debrief, Clinician)
+│   │   ├── components/         # Reusable UI components
+│   │   ├── coach/              # Pose overlay, cue player, debrief audio
+│   │   └── hooks/              # WebSocket hook
+│   └── vite.config.js
+│
+├── backend/
+│   └── scripts/                # Utility scripts (cue generation)
+│
+├── tests/
+│   └── test_fhir_observation.py
+│
+├── static/                     # Vite build output (served by FastAPI)
+│
+├── server.py                   # FastAPI server (WebSocket + HTTP)
+├── pose_tracker.py             # MediaPipe pose tracking + sensor fusion
+├── ai_agent.py                 # Gemini Flash wrappers (debrief, prescription parse)
+├── profile.py                  # PT profile dataclass
+├── bq.py                       # BigQuery persistence
+├── coach_voice.py              # ElevenLabs TTS output
+├── coach_chat.py               # Coach chat endpoint
+├── fhir_observation.py         # FHIR R4 Observation builder
+├── sts_norms.py                # Sit-to-stand age/sex norms
+├── mock_state.py               # Fake 4c stream for frontend dev
+├── mock_ws.py                  # Mock WebSocket server
+├── smoke.py                    # Backend smoke tests
+├── run.py                      # Launcher (macOS camera preflight)
+└── requirements.txt
+```
 
 ## Quick start
 
@@ -46,33 +67,36 @@ export PF_BQ_DATASET="physiofusion"      # optional; this is the default
 ```
 
 Both Gemini and BigQuery degrade gracefully without these — the demo runs
-either way. With them set, the AI debrief is spoken at set end, the
-prescription upload works, and every set is persisted to BigQuery.
+either way.
 
 ### No camera / no hardware (develop the dashboard)
+
 ```bash
 .venv/bin/python mock_state.py    # prints a simulated set with an occlusion window
 ```
-Or import in your code:
-```python
-from mock_state import state_stream, sample_set_summary
+
+### Frontend development
+
+```bash
+cd frontend && npm install && npm run dev
 ```
 
-### Backend only, with webcam
+### Backend with webcam
+
 ```bash
 .venv/bin/python run.py
-# open http://127.0.0.1:8000  (smoke dashboard; Agent C will replace)
+# open http://127.0.0.1:8000
 ```
-On macOS the first run will pop a camera permission dialog — accept it.
 
-### Run the backend tests
+### Run tests
+
 ```bash
 .venv/bin/python smoke.py
+python -m tests.test_fhir_observation
 ```
 
 ## Demo beats (in priority order)
 
 1. Live tracking — skeleton overlay + ticking rep counter.
-2. **Occlusion handoff** — step out of frame, `tracking_source` flips to `imu`, depth gauge
-   keeps tracking. This is the entire justification for the hardware. Don't break this.
+2. **Occlusion handoff** — step out of frame, `tracking_source` flips to `imu`, depth gauge keeps tracking.
 3. Set-end Gemini debrief, spoken via ElevenLabs.

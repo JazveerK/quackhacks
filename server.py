@@ -35,6 +35,7 @@ import ai_agent
 import bq
 from coach_voice import router as coach_router
 from coach_chat import router as chat_router
+from fhir_observation import build_sts_observation, QUALITY_THRESHOLD
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -124,6 +125,14 @@ SESSION_USER_ID = os.environ.get("PF_USER_ID", "demo_user")
 set_index = 0
 session_summaries: list[dict] = []
 _session_lock = threading.Lock()
+
+# User context for clinician handoff (age + sex_at_birth).
+# Set via POST /user-context before or during a session.
+_user_context: dict = {}
+
+# In-memory observation store (keyed by session_id) for demo fallback
+# when BigQuery is unavailable.
+_observation_store: dict[str, dict] = {}
 
 
 def _new_session() -> None:
@@ -291,6 +300,31 @@ async def get_profile():
 
 
 # ---------------------------------------------------------------------------
+# User context (age + sex_at_birth) for clinician handoff.
+# ---------------------------------------------------------------------------
+class UserContext(BaseModel):
+    age: int
+    sex_at_birth: str  # "male" | "female"
+
+
+@app.post("/user-context")
+async def set_user_context(ctx: UserContext):
+    """Set age + biological sex for norm-stratified STS interpretation."""
+    global _user_context
+    if ctx.sex_at_birth not in ("male", "female"):
+        raise HTTPException(400, "sex_at_birth must be 'male' or 'female'")
+    if ctx.age < 1 or ctx.age > 120:
+        raise HTTPException(400, "age must be between 1 and 120")
+    _user_context = {"age": ctx.age, "sex_at_birth": ctx.sex_at_birth}
+    return JSONResponse({"status": "ok", "user_context": _user_context})
+
+
+@app.get("/user-context")
+async def get_user_context():
+    return JSONResponse({"user_context": _user_context})
+
+
+# ---------------------------------------------------------------------------
 # Session lifecycle + BigQuery-backed PT view.
 # ---------------------------------------------------------------------------
 @app.get("/session")
@@ -343,11 +377,87 @@ async def end_session():
     )
     adherence_flag = "complete" if all_targets_hit else "partial"
 
+    # ── Build FHIR STS Observation (clinician handoff) ──────────────
+    sts_obs = None
+    share_url = None
+    if _user_context.get("age") and _user_context.get("sex_at_birth"):
+        # Compute per-set tracking confidence mean (average across sets)
+        conf_values = [
+            float(s.get("tracking_confidence_mean", s.get("fusion_confidence", 0.0)))
+            for s in summaries
+        ]
+        tracking_conf_mean = (
+            sum(conf_values) / len(conf_values) if conf_values else 0.0
+        )
+        # Gather tempo / depth stats from summaries
+        concentric_vals = [float(s.get("mean_concentric_s", 1.0)) for s in summaries]
+        eccentric_vals = [float(s.get("mean_eccentric_s", 1.0)) for s in summaries]
+        all_depths_raw = []
+        for s in summaries:
+            all_depths_raw.extend(s.get("rep_depths_deg") or [])
+        peak_flexion = float(min(all_depths_raw)) if all_depths_raw else 180.0
+
+        active_profile = tracker.profile if tracker is not None else DEFAULT_PROFILE
+        obs_session = {
+                "session_id": sid,
+                "patient_ref": f"Patient/{user_id}",
+                "effective_dt": started_at.isoformat(),
+                "issued_dt": datetime.now(timezone.utc).isoformat(),
+                "reps": total_reps,
+                "age": _user_context["age"],
+                "sex": _user_context["sex_at_birth"],
+                "uses_arm_support": False,
+                "tracking_source": "fused",
+                "tracking_confidence_mean": round(tracking_conf_mean, 3),
+                "calibration_id": f"cal-{sid}",
+                "mean_concentric_s": round(sum(concentric_vals) / len(concentric_vals), 2) if concentric_vals else 1.0,
+                "mean_eccentric_s": round(sum(eccentric_vals) / len(eccentric_vals), 2) if eccentric_vals else 1.0,
+                "peak_knee_flexion_deg": peak_flexion,
+                "rom_delta_vs_baseline_deg": 0.0,
+                "pain_nprs": None,
+                "adherence_completed": sets_count,
+                "adherence_prescribed": int(active_profile.sets),
+                "clinical_flags": {
+                    "rom_regression": False,
+                    "tempo_guarding": False,
+                    "progression_stalled": False,
+                },
+            }
+        try:
+            sts_obs = build_sts_observation(obs_session)
+        except ValueError as e:
+            # Age out of validated range (< 60) — build a raw observation
+            # without norm classification per §6.
+            print(f"[server] FHIR observation: age out of range, building without norms: {e}")
+            from fhir_observation import _component
+            sts_obs = {
+                "resourceType": "Observation",
+                "id": sid,
+                "meta": {"tag": [{"system": "urn:physiofusion:tags", "code": "patient-administered-remote-assessment"}]},
+                "status": "final" if tracking_conf_mean >= QUALITY_THRESHOLD else "preliminary",
+                "code": {"coding": [{"system": "http://loinc.org", "code": "66247-8", "display": "30-second Chair Stand Test"}]},
+                "subject": {"reference": f"Patient/{user_id}"},
+                "effectiveDateTime": started_at.isoformat(),
+                "valueQuantity": {"value": total_reps, "unit": "reps"},
+                "note": [
+                    {"text": "This observation is observational data intended for clinician review and is NOT a clinical diagnosis."},
+                    {"text": f"Age {_user_context['age']} is outside the validated range (60-94); norm classification omitted."},
+                ],
+                "component": [],
+            }
+        except Exception as e:
+            print(f"[server] FHIR observation build failed: {e}")
+            sts_obs = None
+        if sts_obs:
+            _observation_store[sid] = sts_obs
+            share_url = f"/share/{sid}"
+
     # Write the session row (best-effort).
     bq.insert_session(
         session_id=sid, user_id=user_id, started_at=started_at,
         sets_count=sets_count, total_reps=total_reps,
         avg_depth=avg_depth, adherence_flag=adherence_flag,
+        sts_observation=sts_obs,
     )
 
     # Gemini progress report (gracefully degrades to None).
@@ -365,6 +475,8 @@ async def end_session():
         "avg_depth": avg_depth,
         "adherence_flag": adherence_flag,
         "report": report,
+        "share_url": share_url,
+        "sts_observation": sts_obs,
     })
 
 
@@ -377,6 +489,32 @@ async def sets_recent(limit: int = 50):
     """
     rows = bq.query_recent_sets(limit=max(1, min(int(limit), 500)))
     return JSONResponse({"rows": rows, "bq_available": bq.is_available()})
+
+
+# ---------------------------------------------------------------------------
+# Clinician handoff route.
+# ---------------------------------------------------------------------------
+@app.get("/share/{session_id}")
+async def share_handoff_page(session_id: str):
+    """Serve the clinician handoff SPA shell. The frontend fetches the
+    observation via the JSON API below."""
+    return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/api/share/{session_id}")
+async def share_handoff_api(session_id: str):
+    """Return the FHIR Observation for a session (JSON API for the frontend)."""
+    # Try in-memory store first (demo), then BigQuery.
+    obs = _observation_store.get(session_id)
+    if obs is None:
+        row = bq.query_session(session_id)
+        if row and row.get("sts_observation"):
+            obs = row["sts_observation"]
+    if obs is None:
+        raise HTTPException(404, "No observation found for this session. "
+                            "The session may not exist or tracking quality "
+                            "was insufficient.")
+    return JSONResponse({"session_id": session_id, "observation": obs})
 
 
 # ---------------------------------------------------------------------------

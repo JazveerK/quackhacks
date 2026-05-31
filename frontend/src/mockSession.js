@@ -12,6 +12,60 @@ const PROFILE = {
   source: 'default',
 }
 
+// ── Synthetic 33-point landmarks for skeleton overlay ────────────────
+// Generates a side-view squat pose from knee angle.
+// Only the 8 key joints move; the rest are parked off-screen.
+function makeLandmarks(angleDeg) {
+  // Normalized coords (0-1), simulating a side-on camera view.
+  // Person centered at x≈0.5, feet at y≈0.85
+
+  const ankleY = 0.85
+  const ankleX = 0.5
+  const shinLen = 0.18
+  const thighLen = 0.18
+  const torsoLen = 0.2
+
+  // Knee angle in radians
+  const kneeRad = (angleDeg * Math.PI) / 180
+
+  // Shin: roughly vertical, slight tilt back at deep squat
+  const shinTilt = Math.max(0, (180 - angleDeg) * 0.002)
+  const kneeX = ankleX - shinLen * Math.sin(shinTilt)
+  const kneeY = ankleY - shinLen * Math.cos(shinTilt)
+
+  // Thigh: angle from shin = pi - kneeAngle
+  const thighAngle = Math.PI - kneeRad
+  const hipX = kneeX - thighLen * Math.sin(thighAngle + shinTilt)
+  const hipY = kneeY - thighLen * Math.cos(thighAngle + shinTilt)
+
+  // Shoulders above hips, slight forward lean in deep squat
+  const leanFwd = Math.max(0, (180 - angleDeg) * 0.001)
+  const shoulderX = hipX - torsoLen * Math.sin(leanFwd)
+  const shoulderY = hipY - torsoLen
+
+  // Build 33 landmarks (MediaPipe pose format)
+  // Most are placeholder; we only need shoulders (11,12), hips (23,24), knees (25,26), ankles (27,28)
+  const lm = Array.from({ length: 33 }, () => ({
+    x: 0, y: 0, z: 0, visibility: 0.1,
+  }))
+
+  const vis = 0.95
+
+  // Left side (visible in side view)
+  lm[11] = { x: shoulderX - 0.03, y: shoulderY, z: 0, visibility: vis }  // L shoulder
+  lm[23] = { x: hipX - 0.03, y: hipY, z: 0, visibility: vis }            // L hip
+  lm[25] = { x: kneeX - 0.01, y: kneeY, z: 0, visibility: vis }          // L knee
+  lm[27] = { x: ankleX - 0.01, y: ankleY, z: 0, visibility: vis }        // L ankle
+
+  // Right side (slightly offset for depth)
+  lm[12] = { x: shoulderX + 0.03, y: shoulderY, z: 0, visibility: vis }  // R shoulder
+  lm[24] = { x: hipX + 0.03, y: hipY, z: 0, visibility: vis }            // R hip
+  lm[26] = { x: kneeX + 0.01, y: kneeY, z: 0, visibility: vis }          // R knee
+  lm[28] = { x: ankleX + 0.01, y: ankleY, z: 0, visibility: vis }        // R ankle
+
+  return lm
+}
+
 function makeSummary(repDepths) {
   const depths = repDepths.length > 0 ? repDepths : [92]
   const targetDeg = 95
@@ -99,6 +153,8 @@ export function useMockSession() {
     personal_target_depth_deg: 95,
     setup_status: { ok: true, severity: 'good', code: 'ok', hint: 'Tracking — go.' },
     profile: PROFILE,
+    pose_landmarks: makeLandmarks(170),
+    is_mock: true,
   })
 
   const [summary, setSummary] = useState(null)
@@ -132,7 +188,7 @@ export function useMockSession() {
         r.setEnded = true
         const sum = makeSummary(r.repDepths)
         setSummary(sum)
-        setState(prev => ({ ...prev, phase: 'DEBRIEF', angle: 170, rep_count: r.reps }))
+        setState(prev => ({ ...prev, phase: 'DEBRIEF', angle: 170, rep_count: r.reps, pose_landmarks: makeLandmarks(170) }))
         setTimeout(() => {
           setAiDebrief({ text: sum.ai_debrief, summary_seq: 1 })
         }, 1500)
@@ -144,6 +200,9 @@ export function useMockSession() {
       if (angle > 100 && angle < 120 && r.reps >= 5) flags.push('shallow')
 
       const depth_state = angle < 95 ? 'below_parallel' : angle < 100 ? 'at_parallel' : 'shallow'
+
+      // Generate synthetic landmarks matching the current knee angle
+      const pose_landmarks = occluded ? null : makeLandmarks(angle)
 
       setState({
         phase: 'SET_ACTIVE',
@@ -164,6 +223,8 @@ export function useMockSession() {
           ? { ok: false, severity: 'warning', code: 'legs_out_of_frame', hint: 'Step back so your full body is in the camera.' }
           : { ok: true, severity: 'good', code: 'ok', hint: 'Tracking — go.' },
         profile: PROFILE,
+        pose_landmarks,
+        is_mock: true,
       })
     }, 40) // ~25 fps
 
@@ -182,7 +243,7 @@ export function useMockSession() {
     r.setEnded = true
     const sum = makeSummary(r.repDepths)
     setSummary(sum)
-    setState(prev => ({ ...prev, phase: 'DEBRIEF', angle: 170 }))
+    setState(prev => ({ ...prev, phase: 'DEBRIEF', angle: 170, pose_landmarks: makeLandmarks(170) }))
     setTimeout(() => setAiDebrief({ text: sum.ai_debrief, summary_seq: 1 }), 1500)
   }
 

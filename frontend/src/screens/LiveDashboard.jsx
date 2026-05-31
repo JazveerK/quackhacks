@@ -26,8 +26,8 @@ export default function LiveDashboard({ setScreen }) {
 
   const target = state.personal_target_depth_deg ?? 95
 
-  // Show setup pose guide before the active set
-  if (!setupDone && state.phase === "SET_ACTIVE" && state.rep_count === 0) {
+  // Show setup pose guide before the active set (skip in mock mode)
+  if (!setupDone && !state.is_mock && state.phase === "SET_ACTIVE" && state.rep_count === 0) {
     return (
       <div className="flex flex-col h-full p-4">
         <SetupPoseGuide
@@ -43,10 +43,8 @@ export default function LiveDashboard({ setScreen }) {
 
   const angle = state.angle ?? 180
   const tempo = state.tempo ?? 0
-  const imuQ = state.imu_quality ?? 0
-  const vis = state.landmark_visibility ?? 0
 
-  // Depth status — icon + text + color (triple redundancy)
+  // Depth status — icon + text + color
   let depthLabel, depthVariant, depthIcon
   if (angle <= target + 5) {
     depthLabel = "At target"
@@ -66,61 +64,72 @@ export default function LiveDashboard({ setScreen }) {
   const targetTempo = 3.0
   let tempoLabel = "Waiting…"
   if (tempo > 0) {
-    if (Math.abs(tempo - targetTempo) < 0.5) tempoLabel = "Steady · within range"
+    if (Math.abs(tempo - targetTempo) < 0.5) tempoLabel = "Steady"
     else if (tempo < targetTempo) tempoLabel = "A bit fast"
     else tempoLabel = "Nice and slow"
   }
 
   return (
     <div className="flex flex-col h-full">
-      {/* 3-column grid — camera hero (60%), metrics (25%), sidebar (15%) */}
-      <div className="flex-1 grid grid-cols-[3fr_1.25fr_0.75fr] gap-3 p-3 min-h-0
-                       max-[1023px]:grid-cols-[3fr_1.5fr] max-[767px]:grid-cols-1">
+      {/* 2-column: camera hero + metrics sidebar */}
+      <div className="flex-1 flex gap-3 p-3 min-h-0 lg:flex-row flex-col">
 
-        {/* Camera (hero) with per-rep bar overlay */}
-        <CameraPanel
-          frame={null}
-          repDepths={state.rep_depths}
-          targetDeg={target}
-          landmarks={state.pose_landmarks}
-        />
+        {/* Camera hero — takes remaining space */}
+        <div className="flex-1 min-h-[280px] min-w-0">
+          <CameraPanel
+            frame={null}
+            repDepths={state.rep_depths}
+            targetDeg={target}
+            landmarks={state.pose_landmarks}
+          />
+        </div>
 
-        {/* Metrics column */}
-        <div className="flex flex-col gap-3 min-h-0 overflow-y-auto">
+        {/* Metrics sidebar — fixed width on desktop, full width on mobile */}
+        <div className="lg:w-80 w-full shrink-0 flex flex-col gap-3 min-h-0 overflow-y-auto stagger-enter">
+
+          {/* Rep counter — hero metric */}
           <RepCounter state={state} />
 
           {/* Knee depth with arc gauge */}
-          <div
-            className="bg-white rounded-2xl p-5"
-            aria-label={`Knee depth ${Math.round(angle)} degrees, ${depthLabel}`}
-          >
-            <div className="text-[12px] text-ink-faint font-medium uppercase tracking-wide mb-2">Knee depth</div>
-            <div className="flex items-center gap-2.5 mb-3">
-              <span className="text-[28px] font-semibold text-ink tabular-nums leading-none tracking-tight">
-                {angle > 0 ? Math.round(angle) : "—"}°
-              </span>
+          <div className="bg-white rounded-2xl p-4">
+            <div className="flex items-center justify-between mb-3">
+              <div className="text-[12px] text-ink-faint font-medium uppercase tracking-wide">Knee depth</div>
               <Pill variant={depthVariant}>
                 <i className={`ti ${depthIcon} text-[11px]`} />
                 {depthLabel}
               </Pill>
             </div>
-            <DepthArc angle={angle} target={target} depthVariant={depthVariant} />
-          </div>
-
-          {/* Descent tempo */}
-          <div
-            className="bg-white rounded-2xl p-5"
-            aria-label={`Descent tempo ${tempo > 0 ? tempo.toFixed(1) : "no data"} seconds, ${tempoLabel}`}
-          >
-            <div className="text-[12px] text-ink-faint font-medium uppercase tracking-wide mb-2">Descent tempo</div>
-            <span className="text-[28px] font-semibold text-ink tabular-nums leading-none tracking-tight">
-              {tempo > 0 ? tempo.toFixed(1) : "—"}
-              <span className="text-[14px] font-medium text-ink-faint ml-1">s</span>
-            </span>
-            <div className="text-[13px] text-ink-soft mt-2 font-medium">
-              {tempoLabel}
+            <div className="flex items-center gap-4">
+              <DepthArc angle={angle} target={target} depthVariant={depthVariant} />
+              <div>
+                <span
+                  className="text-[32px] font-semibold text-ink tabular-nums leading-none tracking-tight"
+                  aria-label={`Knee depth ${Math.round(angle)} degrees`}
+                >
+                  {angle > 0 ? Math.round(angle) : "—"}°
+                </span>
+                <div className="text-[12px] text-ink-faint mt-1">Target: {target}°</div>
+              </div>
             </div>
           </div>
+
+          {/* Descent tempo — compact */}
+          <div
+            className="bg-white rounded-2xl p-4 flex items-center justify-between"
+            aria-label={`Descent tempo ${tempo > 0 ? tempo.toFixed(1) : "no data"} seconds`}
+          >
+            <div>
+              <div className="text-[12px] text-ink-faint font-medium uppercase tracking-wide mb-1">Descent tempo</div>
+              <span className="text-[13px] text-ink-soft font-medium">{tempoLabel}</span>
+            </div>
+            <span className="text-[28px] font-semibold text-ink tabular-nums leading-none tracking-tight">
+              {tempo > 0 ? tempo.toFixed(1) : "—"}
+              <span className="text-[13px] font-medium text-ink-faint ml-0.5">s</span>
+            </span>
+          </div>
+
+          {/* Tracking source — shows camera/IMU signal bars */}
+          <TrackingSource state={state} />
 
           {/* Setup hint */}
           {state.setup_status && state.setup_status.severity !== "good" && (
@@ -129,41 +138,13 @@ export default function LiveDashboard({ setScreen }) {
                 ? "bg-warn-bg text-warn"
                 : "bg-surface text-ink-faint"
             }`}>
-              <i className="ti ti-info-circle text-[16px]" />
+              <i className="ti ti-info-circle text-[16px] shrink-0" />
               {state.setup_status.hint}
             </div>
           )}
-        </div>
 
-        {/* Sidebar — fusion indicators + actions */}
-        <div className="flex flex-col gap-3 min-h-0 overflow-y-auto
-                        max-[1023px]:flex-row max-[1023px]:flex-wrap max-[767px]:flex-row">
-          <TrackingSource state={state} />
-
-          {/* IMU quality */}
-          <div className="bg-white rounded-2xl p-5" aria-label={`IMU quality ${Math.round(imuQ * 100)} percent`}>
-            <div className="text-[12px] text-ink-faint font-medium uppercase tracking-wide mb-2">IMU quality</div>
-            <span className={`text-[22px] font-semibold tabular-nums ${imuQ < 0.5 ? "text-warn" : "text-ink"}`}>
-              {Math.round(imuQ * 100)}%
-            </span>
-          </div>
-
-          {/* Visibility */}
-          <div className="bg-white rounded-2xl p-5" aria-label={`Landmark visibility ${Math.round(vis * 100)} percent`}>
-            <div className="text-[12px] text-ink-faint font-medium uppercase tracking-wide mb-2">Visibility</div>
-            <span className={`text-[22px] font-semibold tabular-nums ${vis < 0.5 ? "text-warn" : "text-ink"}`}>
-              {Math.round(vis * 100)}%
-            </span>
-            {vis < 0.5 && (
-              <div className="flex items-center gap-1.5 mt-2 text-[12px] text-warn font-medium">
-                <i className="ti ti-alert-circle text-[14px]" />
-                Low visibility
-              </div>
-            )}
-          </div>
-
-          {/* End set — pinned to bottom */}
-          <div className="mt-auto">
+          {/* End set button — pushed to bottom */}
+          <div className="mt-auto pt-2">
             <button
               type="button"
               onClick={() => setScreen("debrief")}
@@ -180,20 +161,20 @@ export default function LiveDashboard({ setScreen }) {
         </div>
       </div>
 
-      {/* Form cue banner */}
+      {/* Form cue banner — slides up from bottom */}
       <FormCueBanner state={state} />
     </div>
   )
 }
 
-/* Half-circle arc gauge */
+/* Half-circle arc gauge — compact version */
 function DepthArc({ angle, target, depthVariant }) {
   const A_MIN = 60
   const A_MAX = 180
   const pct = Math.max(0, Math.min(1, (A_MAX - angle) / (A_MAX - A_MIN)))
   const targetPct = Math.max(0, Math.min(1, (A_MAX - target) / (A_MAX - A_MIN)))
 
-  const R = 60, CX = 70, CY = 70
+  const R = 36, CX = 44, CY = 44
 
   function pt(frac) {
     const a = Math.PI - frac * Math.PI
@@ -214,12 +195,12 @@ function DepthArc({ angle, target, depthVariant }) {
       : "var(--color-ink-faint)"
 
   return (
-    <svg viewBox="0 0 140 80" className="w-full max-w-[180px] mx-auto" role="img" aria-hidden="true">
-      <path d={arc(0, 1)} fill="none" stroke="var(--color-surface)" strokeWidth="10" strokeLinecap="round" />
+    <svg viewBox="0 0 88 50" className="w-20 shrink-0" role="img" aria-hidden="true">
+      <path d={arc(0, 1)} fill="none" stroke="var(--color-surface)" strokeWidth="7" strokeLinecap="round" />
       {pct > 0.01 && (
-        <path d={arc(0, pct)} fill="none" stroke={fillColor} strokeWidth="10" strokeLinecap="round" />
+        <path d={arc(0, pct)} fill="none" stroke={fillColor} strokeWidth="7" strokeLinecap="round" />
       )}
-      <circle cx={tx} cy={ty} r="5" fill="var(--color-ok)" stroke="white" strokeWidth="2.5" />
+      <circle cx={tx} cy={ty} r="4" fill="var(--color-ok)" stroke="white" strokeWidth="2" />
     </svg>
   )
 }
