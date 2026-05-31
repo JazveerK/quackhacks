@@ -26,12 +26,10 @@ const phaseForScreen = {
 // sees in-browser tracking immediately (no backend check-in flow).
 const CLIENT_TRACKING = import.meta.env.VITE_CLIENT_TRACKING === "1"
 
-// Hosted demo build (VITE_DEMO=1): the cloud server has no webcam, so the live
-// session plays a SIMULATED squat set. This banner makes that explicit.
-const DEMO = import.meta.env.VITE_DEMO === "1"
-
+// The banner is shown only when the SERVER reports demo mode (GET /config ->
+// demo_mode), i.e. the camera-less PF_DEMO cloud deploy. The shipped bundle is
+// the real product; nothing demo-specific is baked into the build.
 function DemoBanner() {
-  if (!DEMO) return null
   return (
     <div
       style={{ background: "#F59E0B", color: "#3a2a05" }}
@@ -45,6 +43,15 @@ function DemoBanner() {
 
 export default function App() {
   const [screen, setScreen] = useState(CLIENT_TRACKING ? "live" : "checkin")
+  const [demoMode, setDemoMode] = useState(false)
+
+  // Ask the server whether this is the demo deploy (camera-less PF_DEMO).
+  useEffect(() => {
+    fetch("/config")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => { if (d?.demo_mode) setDemoMode(true) })
+      .catch(() => {})
+  }, [])
   // Today's workout plan, built on the check-in screen and driven through
   // the live session: [{ id, name, sets, reps }]. `workoutPos` tracks where we
   // are — which exercise (0-based) and which set (1-based).
@@ -68,7 +75,7 @@ export default function App() {
   if (screen === "handoff") {
     return (
       <div className="flex flex-col h-full">
-        <DemoBanner />
+        {demoMode && <DemoBanner />}
         <AppHeader
           context={["Clinician Handoff"]}
           phase="Handoff"
@@ -83,7 +90,7 @@ export default function App() {
 
   return (
     <div className="flex flex-col h-full">
-      <DemoBanner />
+      {demoMode && <DemoBanner />}
       <AppHeader
         context={["Bodyweight Squat"]}
         phase={phase}

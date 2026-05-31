@@ -371,6 +371,15 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
+@app.get("/config")
+async def config():
+    """Runtime feature flags for the frontend. `demo_mode` is true only when the
+    server is running PF_DEMO (camera-less synthetic stream) — the frontend uses
+    it to show a 'Demo mode' banner. This keeps the shipped bundle the real
+    product; the label is server-driven, not baked into the build."""
+    return JSONResponse({"demo_mode": DEMO_MODE})
+
+
 @app.get("/")
 async def index():
     return FileResponse(STATIC_DIR / "index.html")
