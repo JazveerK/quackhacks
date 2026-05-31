@@ -22,8 +22,12 @@ const phaseForScreen = {
   handoff:   { phase: "Handoff",    color: "blue" },
 }
 
+// Static/serverless deploy: land straight on the live camera screen so a judge
+// sees in-browser tracking immediately (no backend check-in flow).
+const CLIENT_TRACKING = import.meta.env.VITE_CLIENT_TRACKING === "1"
+
 export default function App() {
-  const [screen, setScreen] = useState("checkin")
+  const [screen, setScreen] = useState(CLIENT_TRACKING ? "live" : "checkin")
   // Today's workout plan, built on the check-in screen and driven through
   // the live session: [{ id, name, sets, reps }]. `workoutPos` tracks where we
   // are — which exercise (0-based) and which set (1-based).
