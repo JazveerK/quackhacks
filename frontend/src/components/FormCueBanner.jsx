@@ -3,6 +3,7 @@ import { useState, useEffect, useRef } from 'react'
 const FLAG_LABELS = {
   shallow: 'Go deeper',
   too_fast: 'Slow it down',
+  incomplete: 'Reach full range',
 }
 
 export default function FormCueBanner({ state }) {

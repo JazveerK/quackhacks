@@ -34,6 +34,9 @@ from profile import PTProfile, DEFAULT_PROFILE
 import ai_agent
 import bq
 import tts
+import exercise_spec
+import spec_generator
+from exercise_spec import ExerciseSpec
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -324,6 +327,50 @@ async def tts_synthesize(payload: TTSRequest):
     return Response(content=audio, media_type="audio/mpeg")
 
 
+@app.get("/exercises")
+async def list_exercises():
+    """Available exercises for the dropdown + which one is active."""
+    active = tracker.exercise_spec.id if tracker is not None else exercise_spec.DEFAULT_EXERCISE.id
+    return JSONResponse({"exercises": exercise_spec.options(), "active": active})
+
+
+class ExerciseDoc(BaseModel):
+    text: str
+
+
+@app.post("/exercise/load")
+async def load_exercise(payload: ExerciseDoc):
+    """Generate an Exercise Spec from a PT's written documentation (Gemini, ONCE)
+    and install it on the tracker, so the SAME real-time engine now coaches that
+    exercise. The LLM never runs on the per-frame rep path.
+
+    Falls back to the default squat spec (with an `error` message) if generation
+    fails — voice/AI is never load-bearing.
+    """
+    if tracker is None:
+        raise HTTPException(503, "tracker not ready yet")
+    text = (payload.text or "").strip()
+    if not text:
+        raise HTTPException(400, "empty documentation")
+
+    result = await asyncio.to_thread(spec_generator.generate_spec_from_docs, text)
+    try:
+        spec = ExerciseSpec.from_dict(result["spec"])
+    except Exception as e:
+        raise HTTPException(502, f"generated spec failed validation: {e}")
+
+    # Register so it shows up in the dropdown + is reselectable, then install it.
+    exercise_spec.REGISTRY[spec.id] = spec
+    tracker.load_exercise_spec(spec)
+
+    return JSONResponse({
+        "spec": result["spec"],
+        "source": result["source"],
+        "error": result["error"],
+        "active": spec.id,
+    })
+
+
 @app.get("/profile")
 async def get_profile():
     """Return the currently active profile."""
@@ -451,6 +498,7 @@ def _agent_context() -> dict:
         last = session_summaries[-1] if session_summaries else None
     ctx = {
         "phase": tracker.phase if tracker is not None else "WAITING_FOR_START",
+        "exercise": tracker.exercise_spec.display_name if tracker is not None else "Squat",
         "prescription": prof.to_dict(),
         "rep_target": tracker.rep_target if tracker is not None else prof.reps_per_set,
         "current_reps": tracker.counter.rep_count if tracker is not None else 0,
@@ -550,6 +598,13 @@ async def ws_endpoint(websocket: WebSocket):
                 tracker.reset_set(rep_target=int(target) if target else None)
                 # Profile may have been pending; broadcast the now-active one.
                 bridge.push_profile(tracker.profile, source=tracker.profile.source)
+            elif cmd == "select_exercise" and tracker is not None:
+                # Switch the graded exercise (squat / push-up). Applied now if no
+                # set is in flight, else queued for the next set. The change shows
+                # up on the next per-frame state broadcast (which carries it).
+                ex_id = (msg.get("id") or msg.get("exercise") or "").strip()
+                if ex_id:
+                    tracker.select_exercise(ex_id)
     except WebSocketDisconnect:
         pass
     finally:

@@ -15,6 +15,17 @@ export default function DebriefScreen({
   const target = summary.rep_target ?? 10
   const depths = summary.rep_depths_deg || []
   const targetDeg = summary.target_depth_deg ?? 95
+  const plural = summary.exercise_ui?.plural || 'reps'
+  const rom = summary.exercise_ui?.rom_metric || 'min'
+  const gMin = summary.exercise_ui?.gauge_min_deg ?? 60
+  const gMax = summary.exercise_ui?.gauge_max_deg ?? 180
+  // "Reached target" + bar height are direction-aware (squat goes lower, raise higher).
+  const reached = (d) => (rom === 'max' ? d >= targetDeg : d <= targetDeg)
+  const barPct = (d) => {
+    const r = (gMax - d) / (gMax - gMin)
+    const v = rom === 'max' ? 1 - r : r
+    return Math.max(5, Math.min(100, v * 100))
+  }
   const debrief = aiDebrief?.text || summary.ai_debrief || summary.templated_debrief || ''
 
   // Build "how it went" items
@@ -78,11 +89,11 @@ export default function DebriefScreen({
         {/* Rep dots */}
         <div className="bg-surface-white rounded-xl border border-border p-5">
           <div className="text-[10px] text-tertiary-text tracking-wide mb-3">
-            Your {reps} squats
+            Your {reps} {plural}
           </div>
           <div className="flex justify-center gap-2 flex-wrap">
             {depths.map((d, i) => {
-              const hit = d <= targetDeg
+              const hit = reached(d)
               return (
                 <div key={i} className="flex flex-col items-center gap-1">
                   <div
@@ -141,7 +152,7 @@ export default function DebriefScreen({
             <div className="text-xs text-secondary-text mt-0.5">
               {lastSet
                 ? 'Wrap up to see your session summary'
-                : `${target} squats · take it a bit slower this time`}
+                : `${target} ${plural} · take it a bit slower this time`}
             </div>
           </div>
           <div className="flex items-center gap-2 shrink-0">
@@ -192,13 +203,13 @@ export default function DebriefScreen({
                 {/* Target line */}
                 <div
                   className="absolute left-0 right-0 border-t border-dashed border-success"
-                  style={{ bottom: `${Math.max(5, ((180 - targetDeg) / 120) * 100)}%` }}
+                  style={{ bottom: `${barPct(targetDeg)}%` }}
                 >
                   <span className="text-[8px] text-success absolute -top-3 right-0">{targetDeg}°</span>
                 </div>
                 {depths.map((d, i) => {
-                  const pct = Math.max(10, ((180 - d) / 120) * 100)
-                  const isShallow = d > targetDeg
+                  const pct = barPct(d)
+                  const isShallow = !reached(d)
                   return (
                     <div key={i} className="flex-1 flex flex-col items-center">
                       <span className="text-[8px] text-tertiary-text mb-0.5">{Math.round(d)}°</span>

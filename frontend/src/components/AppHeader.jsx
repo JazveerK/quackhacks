@@ -30,7 +30,7 @@ export default function AppHeader({ connected, state, profile, currentSet, total
       <div className="flex items-center gap-3">
         <span className="text-info font-medium tracking-wide text-[15px]">PhysioFusion</span>
         <span className="text-tertiary-text text-xs">·</span>
-        <span className="text-secondary-text text-xs">Bodyweight Squat</span>
+        <span className="text-secondary-text text-xs">{state?.exercise_ui?.display_name || 'Squat'}</span>
         {profile?.patient_name && (
           <>
             <span className="text-tertiary-text text-xs">·</span>

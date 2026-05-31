@@ -1,13 +1,21 @@
 export default function DepthGauge({ state, profile }) {
   const angle = state?.angle ?? 180
   const depthState = state?.depth_state || 'shallow'
-  const targetDeg = profile?.depth_deg ?? 95
+  const ex = state?.exercise_ui
+  const targetDeg = state?.target_depth_deg ?? profile?.depth_deg ?? 95
+  const rom = ex?.rom_metric || 'min'
 
-  // Arc gauge: 180° = standing (0% depth), 60° = deep squat (100% depth)
-  const A_MIN = 60
-  const A_MAX = 180
-  const pct = Math.max(0, Math.min(1, (A_MAX - angle) / (A_MAX - A_MIN)))
-  const targetPct = Math.max(0, Math.min(1, (A_MAX - targetDeg) / (A_MAX - A_MIN)))
+  // Arc gauge: 0% = resting, 100% = full range. Range + direction come from the
+  // active exercise: "min" fills as the angle shrinks (squat), "max" fills as it
+  // grows (arm raise).
+  const A_MIN = ex?.gauge_min_deg ?? 60
+  const A_MAX = ex?.gauge_max_deg ?? 180
+  const fill = (a) => {
+    const r = (A_MAX - a) / (A_MAX - A_MIN)
+    return Math.max(0, Math.min(1, rom === 'max' ? 1 - r : r))
+  }
+  const pct = fill(angle)
+  const targetPct = fill(targetDeg)
 
   // SVG half-circle arc
   const R = 60
@@ -44,7 +52,7 @@ export default function DepthGauge({ state, profile }) {
 
   return (
     <div className="bg-surface-white rounded-xl border border-border p-4">
-      <div className="text-[10px] text-tertiary-text tracking-wide mb-1">Knee depth</div>
+      <div className="text-[10px] text-tertiary-text tracking-wide mb-1">{ex?.depth_label || 'Depth'}</div>
       <div className="flex items-center gap-3 mb-2">
         <span className="text-[26px] font-medium text-primary-text tabular-nums leading-none">
           {angle > 0 ? Math.round(angle) : '--'}

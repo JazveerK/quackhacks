@@ -41,6 +41,9 @@ export default function App() {
   function handleEndSet() {
     send({ cmd: 'end_set' })
   }
+  function handleSelectExercise(id) {
+    send({ cmd: 'select_exercise', id })
+  }
   function handleStartNext() {
     send({ cmd: 'reset_set' })
     setSummary(null)
@@ -94,6 +97,7 @@ export default function App() {
         lastReply={agentReply}
         onStartSet={handleStartSet}
         onEndSet={handleEndSet}
+        onSelectExercise={handleSelectExercise}
       />
     )
   }

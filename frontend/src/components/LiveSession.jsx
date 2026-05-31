@@ -8,9 +8,10 @@ import FormCueBanner from './FormCueBanner'
 import SetupHint from './SetupHint'
 import StartGate from './StartGate'
 import VoiceControl from './VoiceControl'
+import ExerciseSelector from './ExerciseSelector'
 
 export default function LiveSession({
-  state, frame, profile, voice, lastReply, onStartSet, onEndSet,
+  state, frame, profile, voice, lastReply, onStartSet, onEndSet, onSelectExercise,
 }) {
   const active = state?.phase === 'SET_ACTIVE'
 
@@ -28,12 +29,17 @@ export default function LiveSession({
           <RepCounter state={state} />
           <DepthGauge state={state} profile={profile} />
           <TempoDisplay state={state} profile={profile} />
-          <RepBars depths={state?.rep_depths} targetDeg={profile?.depth_deg} />
+          <RepBars
+            depths={state?.rep_depths}
+            targetDeg={state?.target_depth_deg ?? profile?.depth_deg}
+            ex={state?.exercise_ui}
+          />
           <SetupHint state={state} />
         </div>
 
         {/* Sidebar column */}
         <div className="flex flex-col gap-3 min-h-0">
+          <ExerciseSelector state={state} onSelect={onSelectExercise} />
           <TrackingSource state={state} />
 
           {/* Controls */}

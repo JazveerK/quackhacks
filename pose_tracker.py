@@ -30,9 +30,14 @@ import mediapipe as mp
 import numpy as np
 
 from profile import PTProfile, DEFAULT_PROFILE
+from exercise_spec import ExerciseSpec, SQUAT_SPEC, DEFAULT_EXERCISE, get as get_exercise
 
 # ---------------------------------------------------------------------------
-# Tunables. Squat-specific. Side view assumed.
+# Tunables. The squat-specific ones below now live in exercises.SQUAT and are
+# kept here only as module-level fallbacks / for the headless smoke test
+# (smoke_reps.py imports DOWN_ENTER_DEG / UP_ENTER_DEG). Per-exercise thresholds
+# are read from the active ExerciseSpec at runtime — see RepCounter.
+# Side view assumed.
 #
 # A few of these are *defaults*: TARGET_DEPTH_DEG, PARALLEL_DEG, FAST_REP_SEC,
 # REP_TARGET_DEFAULT are overridden at runtime by the active PT profile (see
@@ -206,14 +211,32 @@ class _RepState:
     imu_frames: int = 0             # imu-sourced frames during this rep
 
 
-class SquatCounter:
-    """Counts reps, tracks per-rep depth, emits per-rep form flags.
+def _spec_tempo_default(spec: ExerciseSpec) -> float:
+    """The too-fast threshold for a spec: the first tempo rule's min_sec, or the
+    module default when a rule doesn't pin one (e.g. the squat, which gets it
+    from the PT profile at runtime instead)."""
+    for r in spec.form_rules:
+        if r.type == "tempo" and r.min_sec is not None:
+            return float(r.min_sec)
+    return FAST_REP_SEC
+
+
+class RepCounter:
+    """Counts reps, tracks per-rep ROM, emits per-rep form flags.
+
+    Generic over an `ExerciseSpec`. The rep state machine, ROM gate, and form
+    rules all read from the spec, and every comparison is direction-aware via a
+    sign (`sgn`): for a "min" exercise (squat / curl) a good rep drives the angle
+    DOWN; for a "max" exercise (arm raise / leg extension) it drives the angle
+    UP. `progress = sgn * angle` always increases as the rep advances, so one
+    machine grades both. Run with `SQUAT_SPEC`, the behaviour is identical to the
+    original hard-coded squat counter.
 
     Per-rep records (parallel arrays indexed by rep number):
-        rep_depths        — min knee angle (deg)
+        rep_depths        — the rep's extreme driving angle, deg
         rep_tempos        — total seconds (eccentric + concentric)
-        rep_eccentric     — descent seconds (rep_start -> deepest point)
-        rep_concentric    — ascent + hold seconds (deepest point -> rep_end)
+        rep_eccentric     — active-phase seconds (rep_start -> extreme)
+        rep_concentric    — return seconds (extreme -> rep_end)
         rep_flags         — list of form flags raised on that rep
         rep_cam_frac      — fraction of rep frames that were camera-tracked
         rep_end_t         — clock time the rep completed
@@ -221,22 +244,38 @@ class SquatCounter:
 
     def __init__(
         self,
-        target_depth_deg: float = TARGET_DEPTH_DEG,
-        fast_rep_sec: float = FAST_REP_SEC,
-        parallel_buffer_deg: float = 5.0,
+        spec: ExerciseSpec = SQUAT_SPEC,
+        target_depth_deg: Optional[float] = None,
+        fast_rep_sec: Optional[float] = None,
+        parallel_buffer_deg: Optional[float] = None,
     ):
-        # Profile-driven thresholds (passed in at construction; constant for
-        # the duration of one set).
-        self.target_depth_deg = float(target_depth_deg)
-        self.fast_rep_sec = float(fast_rep_sec)
-        # "shallow" = bottom angle > parallel threshold; parallel is target + buffer.
-        self.parallel_deg = self.target_depth_deg + float(parallel_buffer_deg)
-        # A rep must bend to at least this knee angle (lower = deeper) to count.
-        # Sits a little above parallel so a real partial squat still counts, but a
-        # shallow bob that barely dips past DOWN_ENTER_DEG does not.
-        self.count_depth_deg = self.parallel_deg + COUNT_DEPTH_MARGIN_DEG
+        self.spec = spec
+        rd = spec.rep_definition
+        # +1 when a good rep means a LARGER angle (raise), -1 when SMALLER (squat).
+        self.sgn = 1.0 if spec.rom_metric == "max" else -1.0
+        self.start_angle = rd.start_angle_deg
+        self.trigger_angle = rd.trigger_angle_deg
+        self.return_angle = rd.return_angle_deg
+
+        # target overrides the spec default when provided (squat uses the PT
+        # profile's depth); tempo likewise.
+        self.target_depth_deg = float(
+            target_depth_deg if target_depth_deg is not None else rd.target_angle_deg
+        )
+        self.fast_rep_sec = float(
+            fast_rep_sec if fast_rep_sec is not None else _spec_tempo_default(spec)
+        )
+        buffer = (parallel_buffer_deg if parallel_buffer_deg is not None
+                  else spec.parallel_buffer_deg)
+        # "parallel" = edge of the good-rep band; "count" = how far past it a rep
+        # must go to count at all. Both move in the active direction via sgn.
+        self.parallel_deg = self.target_depth_deg - self.sgn * float(buffer)
+        self.count_depth_deg = self.parallel_deg - self.sgn * spec.count_margin_deg
+        # The value a rep's running extreme starts at (worst possible progress).
+        self._extreme_init = 180.0 if self.sgn < 0 else 0.0
 
         self._s = _RepState()
+        self._s.min_angle_this_rep = self._extreme_init
         self.rep_count = 0
         self.rep_depths: list[float] = []
         self.rep_tempos: list[float] = []
@@ -245,7 +284,7 @@ class SquatCounter:
         self.rep_flags: list[list[str]] = []
         self.rep_cam_frac: list[float] = []
         self.rep_end_t: list[float] = []
-        self.flag_counts: dict[str, int] = {"shallow": 0, "too_fast": 0}
+        self.flag_counts: dict[str, int] = {r.name: 0 for r in spec.form_rules}
         self.voided_reps = 0
         self._down_streak = 0
         self._up_streak = 0
@@ -260,6 +299,7 @@ class SquatCounter:
         """Abandon the current rep without counting. Used when stuck in 'down'
         for too long (user sat down, walked off, etc.)."""
         self._s = _RepState()
+        self._s.min_angle_this_rep = self._extreme_init
         self._down_streak = 0
         self._up_streak = 0
 
@@ -267,18 +307,22 @@ class SquatCounter:
         """Feed one frame's smoothed angle. Returns flags newly raised this frame.
 
         `source` is the tracking source ("camera" or "imu") for THIS frame.
-        Per-rep camera fraction drives a rep-validity check at completion.
+        Per-rep camera fraction drives a rep-validity check at completion. All
+        comparisons go through `sgn` so the machine is direction-agnostic.
         """
         flags: list[str] = []
         s = self._s
+        sgn = self.sgn
 
-        # Track most-recent "standing" frame so we can attribute the full
-        # descent (not just the part below DOWN_ENTER_DEG) as eccentric time.
-        if angle >= DESCENT_START_DEG:
+        # Track the most-recent resting frame so we can attribute the full active
+        # phase (not just the part past the trigger) as eccentric time. "At rest"
+        # = progress at or below the start position.
+        if sgn * angle <= sgn * self.start_angle:
             self._t_last_standing = now
 
         if s.phase == "up":
-            if angle < DOWN_ENTER_DEG:
+            # Enter the active phase once we pass the trigger toward the peak.
+            if sgn * angle > sgn * self.trigger_angle:
                 self._down_streak += 1
             else:
                 self._down_streak = 0
@@ -294,17 +338,19 @@ class SquatCounter:
                 s.imu_frames = 0
                 self._down_streak = 0
                 self._up_streak = 0
-        else:  # "down"
+        else:  # "down" / active phase
             # Track per-frame source attribution for this rep.
             if source == "camera":
                 s.cam_frames += 1
             else:
                 s.imu_frames += 1
 
-            if angle < s.min_angle_this_rep:
+            # Update the running extreme (most-progressed angle this rep).
+            if sgn * angle > sgn * s.min_angle_this_rep:
                 s.min_angle_this_rep = angle
                 s.t_at_min = now
-            if angle > UP_ENTER_DEG:
+            # Complete the rep once we cross back past the return threshold.
+            if sgn * angle < sgn * self.return_angle:
                 self._up_streak += 1
             else:
                 self._up_streak = 0
@@ -318,12 +364,12 @@ class SquatCounter:
                 cam_frac = s.cam_frames / total_frames if total_frames else 0.0
 
                 # Validity gates. A rep must be a plausible tempo, mostly
-                # camera-tracked, AND actually reach a squat depth (not a shallow
-                # bob just past the descent threshold).
+                # camera-tracked, AND actually progress past the count gate (not a
+                # twitch just past the trigger).
                 valid = (
                     MIN_REP_SEC <= tempo <= MAX_REP_SEC
                     and cam_frac >= MIN_CAM_FRAC
-                    and depth <= self.count_depth_deg
+                    and sgn * depth >= sgn * self.count_depth_deg
                 )
                 if valid:
                     self.rep_count += 1
@@ -333,25 +379,41 @@ class SquatCounter:
                     self.rep_concentric.append(round(concentric, 2))
                     self.rep_cam_frac.append(round(cam_frac, 2))
                     self.rep_end_t.append(now)
-                    rep_flags: list[str] = []
-                    if depth > self.parallel_deg:
-                        rep_flags.append("shallow")
-                        self.flag_counts["shallow"] += 1
-                    if tempo < self.fast_rep_sec:
-                        rep_flags.append("too_fast")
-                        self.flag_counts["too_fast"] += 1
+                    rep_flags = self._eval_form(depth, tempo)
+                    for f in rep_flags:
+                        self.flag_counts[f] = self.flag_counts.get(f, 0) + 1
                     self.rep_flags.append(rep_flags)
                     flags = list(rep_flags)
                 else:
                     self.voided_reps += 1
                 # Reset rep state regardless.
                 s.phase = "up"
-                s.min_angle_this_rep = 180.0
+                s.min_angle_this_rep = self._extreme_init
                 s.cam_frames = 0
                 s.imu_frames = 0
                 self._down_streak = 0
                 self._up_streak = 0
         return flags
+
+    def _eval_form(self, depth: float, tempo: float) -> list[str]:
+        """Per-rep form flags from the spec's form_rules (direction-aware)."""
+        sgn = self.sgn
+        out: list[str] = []
+        for rule in self.spec.form_rules:
+            if rule.type == "tempo":
+                thr = rule.min_sec if rule.min_sec is not None else self.fast_rep_sec
+                if tempo < thr:
+                    out.append(rule.name)
+            elif rule.type == "shallow":
+                if sgn * depth < sgn * self.parallel_deg:
+                    out.append(rule.name)
+            elif rule.type == "target_not_reached":
+                if sgn * depth < sgn * self.target_depth_deg:
+                    out.append(rule.name)
+            elif rule.type == "rom":
+                if rule.threshold_deg is not None and sgn * depth < sgn * rule.threshold_deg:
+                    out.append(rule.name)
+        return out
 
     def current_phase(self) -> str:
         return self._s.phase
@@ -361,6 +423,27 @@ class SquatCounter:
 
     def last_tempo(self) -> float:
         return self.rep_tempos[-1] if self.rep_tempos else 0.0
+
+
+class SquatCounter(RepCounter):
+    """Back-compat squat counter (smoke_reps.py and older callers use this).
+
+    Equivalent to ``RepCounter(SQUAT, ...)`` — defaults preserve the original
+    squat behaviour byte-for-byte.
+    """
+
+    def __init__(
+        self,
+        target_depth_deg: float = TARGET_DEPTH_DEG,
+        fast_rep_sec: float = FAST_REP_SEC,
+        parallel_buffer_deg: float = 5.0,
+    ):
+        super().__init__(
+            SQUAT_SPEC,
+            target_depth_deg=target_depth_deg,
+            fast_rep_sec=fast_rep_sec,
+            parallel_buffer_deg=parallel_buffer_deg,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -383,6 +466,7 @@ class PoseTracker:
         on_profile_change: Optional[Callable[[PTProfile], None]] = None,
         require_start_gesture: bool = True,
         enable_gesture: bool = False,
+        exercise: Optional[str] = None,
     ):
         self.imu = imu_source or MockIMU()
         self.on_state = on_state or (lambda s: None)
@@ -403,9 +487,19 @@ class PoseTracker:
         # An explicit rep_target arg (if given) wins over the profile's value
         # so existing callers / tests stay unaffected.
         self.profile: PTProfile = profile or DEFAULT_PROFILE
+        # Active exercise (drives which joint angle is graded + the thresholds).
+        # Independent of the profile for now; selected via select_exercise().
+        self.exercise_spec: ExerciseSpec = get_exercise(exercise) if exercise else DEFAULT_EXERCISE
+        self._joint_idx = self._resolve_joint(self.exercise_spec)
+        # Pending exercise switch — applied on the next reset_set() so the rules
+        # don't change mid-set (mirrors _pending_profile).
+        self._pending_exercise: Optional[ExerciseSpec] = None
+        self._sgn: float = -1.0
         self.target_depth_deg: float = self.profile.depth_deg
         self.fast_rep_sec: float = self.profile.tempo_sec
         self.parallel_deg: float = self.target_depth_deg + 5.0
+        # Override target / tempo / parallel / sign from the active exercise spec.
+        self._apply_exercise_targets()
         self.rep_target: int = (
             int(rep_target) if rep_target is not None else self.profile.reps_per_set
         )
@@ -481,13 +575,99 @@ class PoseTracker:
         """Queue a new PT profile. Takes effect on the next `reset_set()`."""
         self._pending_profile = profile.clamp()
 
-    def _fresh_counter(self) -> "SquatCounter":
-        return SquatCounter(
+    def select_exercise(self, exercise_id: str) -> None:
+        """Switch the active exercise (e.g. 'pushup').
+
+        Applied immediately when no set is in flight (WAITING_FOR_START / DEBRIEF
+        / SET_END) so the dashboard updates right away; otherwise queued for the
+        next reset_set() so a live set's rules don't change underneath the user.
+        """
+        spec = get_exercise(exercise_id)
+        if spec.id == self.exercise_spec.id and self._pending_exercise is None:
+            return
+        if self.phase in ("SET_ACTIVE", "COUNTDOWN"):
+            self._pending_exercise = spec
+        else:
+            self._apply_exercise(spec)
+
+    def load_exercise_spec(self, spec: ExerciseSpec) -> None:
+        """Install a spec OBJECT directly (e.g. one an LLM just generated from PT
+        documentation), rather than looking it up by id in the registry. Queued
+        if a set is live, applied immediately otherwise."""
+        if self.phase in ("SET_ACTIVE", "COUNTDOWN"):
+            self._pending_exercise = spec
+        else:
+            self._apply_exercise(spec)
+
+    def _apply_exercise(self, spec: ExerciseSpec) -> None:
+        """Make `spec` the active exercise and rebuild the rep counter. Only safe
+        when no reps are mid-flight (start of a set)."""
+        self.exercise_spec = spec
+        self._joint_idx = self._resolve_joint(spec)
+        self._pending_exercise = None
+        self._apply_exercise_targets()
+        self.counter = self._fresh_counter()
+        self.rom_min = 180.0
+        self.rom_max = 0.0
+        self._active_flags.clear()
+        self._smoothed_angle = None
+        self._last_source = None
+
+    def _apply_exercise_targets(self) -> None:
+        """Set the runtime target / tempo / parallel / sign from the active spec.
+
+        The squat keeps reading its depth + tempo from the PT profile (so an
+        uploaded prescription still drives it); other exercises use the spec's
+        own rep_definition. `parallel_deg` and `_sgn` mirror the rep counter so
+        the live depth_state badge matches how reps are graded.
+        """
+        spec = self.exercise_spec
+        self._sgn = 1.0 if spec.rom_metric == "max" else -1.0
+        if spec.id == SQUAT_SPEC.id:
+            self.target_depth_deg = self.profile.depth_deg
+            self.fast_rep_sec = self.profile.tempo_sec
+        else:
+            self.target_depth_deg = spec.rep_definition.target_angle_deg
+            self.fast_rep_sec = _spec_tempo_default(spec)
+        self.parallel_deg = self.target_depth_deg - self._sgn * spec.parallel_buffer_deg
+
+    @staticmethod
+    def _resolve_joint(spec: ExerciseSpec) -> list:
+        """Resolve the spec's primary joint to a list of candidate landmark-index
+        triples. For side='both' there are two (left + right) and the tracker
+        picks the more visible one per frame; for 'left'/'right' there is one."""
+        def idx(name: str) -> int:
+            return getattr(LM, name).value
+        bases = spec.primary_joint.bases()          # [a, vertex, c]
+        side = spec.primary_joint.side
+        sides = ["LEFT", "RIGHT"] if side == "both" else [side.upper()]
+        candidates: list = []
+        for sd in sides:
+            try:
+                candidates.append(tuple(idx(f"{sd}_{b}") for b in bases))
+            except AttributeError:
+                continue
+        if not candidates:   # last-resort fallback so the tracker never crashes
+            candidates = [
+                (LEFT_HIP, LEFT_KNEE, LEFT_ANKLE),
+                (RIGHT_HIP, RIGHT_KNEE, RIGHT_ANKLE),
+            ]
+        return candidates
+
+    def _fresh_counter(self) -> "RepCounter":
+        return RepCounter(
+            self.exercise_spec,
             target_depth_deg=self.target_depth_deg,
             fast_rep_sec=self.fast_rep_sec,
+            parallel_buffer_deg=self.exercise_spec.parallel_buffer_deg,
         )
 
     def reset_set(self, rep_target: Optional[int] = None) -> None:
+        # Apply any pending exercise switch so the new set grades the right move.
+        if self._pending_exercise is not None:
+            self.exercise_spec = self._pending_exercise
+            self._joint_idx = self._resolve_joint(self.exercise_spec)
+            self._pending_exercise = None
         # Apply any pending profile first so the new set runs on new targets.
         if self._pending_profile is not None:
             self.profile = self._pending_profile
@@ -498,6 +678,9 @@ class PoseTracker:
             if rep_target is None:
                 self.rep_target = int(self.profile.reps_per_set)
             self._pending_profile = None
+        # Re-derive target / tempo / parallel / sign for the (possibly new)
+        # exercise + profile combination before building the fresh counter.
+        self._apply_exercise_targets()
         if rep_target is not None:
             self.rep_target = int(rep_target)
         # New sets wait for a start gesture (unless the tracker is in always-on
@@ -523,34 +706,36 @@ class PoseTracker:
         self._countdown_start = None
 
     # ----- per-frame pipeline -----
-    def _extract_leg(self, landmarks) -> tuple[float, float, tuple, tuple, tuple]:
-        """Pick the more-visible leg.
+    def _extract_limb(self, landmarks) -> tuple[float, float, tuple, tuple, tuple]:
+        """Pick the most-visible candidate of the active exercise's driving joint.
 
-        Returns (avg_visibility, min_visibility, hip, knee, ankle).
-        min_visibility lets us reject predicted/occluded landmarks even when
-        the average looks acceptable.
+        Returns (avg_visibility, min_visibility, a, b, c) where a-b-c is the
+        joint triple (vertex = b). `self._joint_idx` is a list of candidate
+        index-triples (two for a 'both' spec, one for left/right). We pick the
+        most-visible candidate per frame; min_visibility still lets us reject
+        predicted/occluded landmarks even when the average looks acceptable.
         """
-        def pt(idx):
-            lm = landmarks[idx]
-            return (lm.x, lm.y), lm.visibility
+        def read(tri):
+            pts, viss = [], []
+            for i in tri:
+                lm = landmarks[i]
+                pts.append((lm.x, lm.y))
+                viss.append(lm.visibility)
+            return (sum(viss) / 3.0, min(viss), pts[0], pts[1], pts[2])
 
-        lh, lhv = pt(LEFT_HIP)
-        lk, lkv = pt(LEFT_KNEE)
-        la, lav = pt(LEFT_ANKLE)
-        rh, rhv = pt(RIGHT_HIP)
-        rk, rkv = pt(RIGHT_KNEE)
-        ra, rav = pt(RIGHT_ANKLE)
+        candidates = self._joint_idx
+        # Honor an explicit camera-facing side hint when there are two sides.
+        if self.preferred_side == "left" and len(candidates) >= 1:
+            return read(candidates[0])
+        if self.preferred_side == "right" and len(candidates) >= 1:
+            return read(candidates[-1])
 
-        left_avg = (lhv + lkv + lav) / 3.0
-        right_avg = (rhv + rkv + rav) / 3.0
-        # Honor an explicit camera-facing side hint if the caller set one.
-        if self.preferred_side == "left":
-            return left_avg, min(lhv, lkv, lav), lh, lk, la
-        if self.preferred_side == "right":
-            return right_avg, min(rhv, rkv, rav), rh, rk, ra
-        if right_avg >= left_avg:
-            return right_avg, min(rhv, rkv, rav), rh, rk, ra
-        return left_avg, min(lhv, lkv, lav), lh, lk, la
+        best = None
+        for tri in candidates:
+            cand = read(tri)
+            if best is None or cand[0] > best[0]:
+                best = cand
+        return best
 
     def _update_active_flags(self, new_flags: list[str], now: float) -> list[str]:
         for f in new_flags:
@@ -645,9 +830,12 @@ class PoseTracker:
         }
 
     def _depth_state(self, angle: float) -> str:
-        if angle <= self.target_depth_deg:
+        # Direction-aware via sgn: "below_parallel" = reached target (good),
+        # "at_parallel" = within the buffer band, "shallow" = not there yet.
+        s = self._sgn
+        if s * angle >= s * self.target_depth_deg:
             return "below_parallel"
-        if angle <= self.parallel_deg:
+        if s * angle >= s * self.parallel_deg:
             return "at_parallel"
         return "shallow"
 
@@ -656,8 +844,9 @@ class PoseTracker:
             return True
         if self.counter.rep_count >= self.rep_target:
             return True
-        # Stillness: standing tall, not moving for STILL_SECONDS.
-        if angle >= STANDING_DEG and self.counter.current_phase() == "up":
+        # Stillness: resting at the start position, not moving for STILL_SECONDS.
+        rest = self.exercise_spec.rep_definition.start_angle_deg
+        if self._sgn * angle <= self._sgn * rest and self.counter.current_phase() == "up":
             if self._still_since is None:
                 self._still_since = now
             elif now - self._still_since >= STILL_SECONDS and self.counter.rep_count > 0:
@@ -865,7 +1054,8 @@ class PoseTracker:
 
         # Top-level keeps the legacy 4d shape — Agent C wired against it.
         return {
-            "exercise": "bodyweight_squat",
+            "exercise": self.exercise_spec.id,
+            "exercise_ui": self.exercise_spec.to_ui(),
             "reps_completed": c.rep_count,
             "rep_target": self.rep_target,
             "rep_depths_deg": depths,
@@ -937,7 +1127,7 @@ class PoseTracker:
             notes.append("No completed reps in this set.")
             return notes
         notes.append(
-            f"Average knee angle at bottom was {depth_mean:.0f}° "
+            f"Average {self.exercise_spec.angle_noun} at bottom was {depth_mean:.0f}° "
             f"(target {self.target_depth_deg:.0f}°)."
         )
         notes.append(
@@ -1139,11 +1329,11 @@ class PoseTracker:
         if result.pose_landmarks:
             landmarks = result.pose_landmarks.landmark
             self._last_pose_t = now
-            leg_vis, leg_vis_min, hip, knee, ankle = self._extract_leg(landmarks)
-            hip_px = (hip[0] * w, hip[1] * h)
-            knee_px = (knee[0] * w, knee[1] * h)
-            ankle_px = (ankle[0] * w, ankle[1] * h)
-            cam_angle = angle_deg(hip_px, knee_px, ankle_px)
+            leg_vis, leg_vis_min, ja, jb, jc = self._extract_limb(landmarks)
+            a_px = (ja[0] * w, ja[1] * h)
+            b_px = (jb[0] * w, jb[1] * h)
+            c_px = (jc[0] * w, jc[1] * h)
+            cam_angle = angle_deg(a_px, b_px, c_px)
             # Always overlay the skeleton — the dashboard renders this JPEG.
             mp_draw.draw_landmarks(
                 frame,
@@ -1155,8 +1345,13 @@ class PoseTracker:
 
         imu_sample = self.imu.get_latest() or {}
         imu_quality = float(imu_sample.get("quality", 0.0))
-        imu_angle = imu_tilt_to_knee_angle(float(imu_sample.get("tilt", 0.0))) \
-            if imu_sample else None
+        # IMU fusion only applies to exercises whose spec opts in (the squat's
+        # thigh tilt). For others the IMU mapping isn't meaningful, so we stay on
+        # camera and fall back to "none" on occlusion.
+        imu_angle = (
+            imu_tilt_to_knee_angle(float(imu_sample.get("tilt", 0.0)))
+            if imu_sample and self.exercise_spec.use_imu_fusion else None
+        )
 
         camera_trusted = (
             cam_angle is not None
@@ -1335,6 +1530,9 @@ class PoseTracker:
             depth_state = self._depth_state(ref)
         state = {
             "phase": self.phase,
+            "exercise": self.exercise_spec.id,
+            "exercise_ui": self.exercise_spec.to_ui(),
+            "target_depth_deg": round(self.target_depth_deg, 1),
             "angle": round(display_angle, 1),
             "rep_count": self.counter.rep_count,
             "rep_target": self.rep_target,
@@ -1378,6 +1576,23 @@ class PoseTracker:
 # moves the camera_index + side hint from the constructor to call time.
 # ---------------------------------------------------------------------------
 SquatTracker = PoseTracker
+
+
+class ExerciseTracker(PoseTracker):
+    """Generic, spec-driven tracker. Takes an `ExerciseSpec` OBJECT directly
+    (e.g. one generated from PT documentation) rather than a registry id, then
+    runs the exact same real-time engine as the squat — no LLM on the rep path.
+
+        tracker = ExerciseTracker(spec, imu_source=imu, on_state=..., on_set_end=...)
+
+    With `SQUAT_SPEC` it is behaviourally identical to the original squat tracker.
+    """
+
+    def __init__(self, spec: ExerciseSpec, imu_source=None,
+                 on_state=None, on_set_end=None, **kwargs):
+        super().__init__(imu_source=imu_source, on_state=on_state,
+                         on_set_end=on_set_end, **kwargs)
+        self.load_exercise_spec(spec)
 
 
 def run_camera(

@@ -11,6 +11,9 @@ export default function StartGate({ state, profile, onStartSet }) {
   const setup = state?.setup_status
   const ready = setup?.ok !== false
   const target = state?.rep_target ?? profile?.reps_per_set ?? 10
+  const ex = state?.exercise_ui
+  const plural = ex?.plural || 'reps'
+  const positionHint = ex?.position_hint || 'Stand side-on so your whole body is in frame.'
 
   if (phase === 'COUNTDOWN') {
     const n = state?.countdown
@@ -36,7 +39,7 @@ export default function StartGate({ state, profile, onStartSet }) {
         </div>
         <div className="text-base font-medium text-primary-text">Ready when you are</div>
         <p className="text-sm text-secondary-text mt-1">
-          {target} squats this set. Stand side-on so your whole body is in frame.
+          {target} {plural} this set. {positionHint}
         </p>
 
         <div
