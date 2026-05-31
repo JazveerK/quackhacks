@@ -6,3 +6,5 @@ uvicorn[standard]>=0.27.0
 google-generativeai>=0.7.0
 google-cloud-bigquery>=3.0
 python-dotenv>=1.0
+pypdf>=4.0
+python-multipart>=0.0.9

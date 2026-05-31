@@ -232,6 +232,80 @@ def generate_session_report(profile: PTProfile, set_rows: list[dict]) -> Optiona
     return text[:DEBRIEF_CHAR_CAP * 2]  # ~ paragraph
 
 
+_PROGRESS_REPORT_PROMPT_TEMPLATE = """You are a physical therapist writing a brief CROSS-SESSION progress note for a patient's chart. Audience is the CLINICIAN. You do NOT diagnose; you summarize measured range of motion and adherence trends over time.
+
+Knee-angle depth is in degrees: LOWER = deeper squat = BETTER range of motion.
+
+From the patient's session history below (oldest first), write in plain language:
+- 3-4 sentences on the trend in range of motion (avg depth), reps, and adherence across sessions.
+- ONE concrete focus for the next session.
+Encouraging, monitoring tone. No markdown, no bullet lists, no emoji.
+
+SESSION HISTORY (oldest first):
+{history_json}
+"""
+
+
+def _progress_fallback(history) -> str:
+    """Structured templated cross-session summary used when Gemini is unavailable."""
+    if not history:
+        return (
+            "No prior sessions on record yet — this establishes the baseline. "
+            "Keep a consistent routine and the trend will start to build."
+        )
+    n = len(history)
+    completed = sum(1 for s in history if s.get("adherence_flag"))
+    d0 = history[0].get("avg_depth")
+    d1 = history[-1].get("avg_depth")
+    if d0 is not None and d1 is not None:
+        # Lower angle = deeper squat = better ROM.
+        if d1 < d0 - 2:
+            trend = f"Range of motion is improving (average depth {d0:.0f}° to {d1:.0f}°; deeper is better)"
+        elif d1 > d0 + 2:
+            trend = f"Range of motion has dipped slightly (average depth {d0:.0f}° to {d1:.0f}°)"
+        else:
+            trend = f"Range of motion is holding steady (~{d1:.0f}°)"
+    else:
+        trend = "Range of motion is being tracked"
+    return (
+        f"{trend} across {n} session{'s' if n != 1 else ''}. "
+        f"Adherence: {completed}/{n} sessions completed as prescribed. "
+        f"Next session, focus on holding consistent depth through every rep."
+    )
+
+
+def generate_progress_report(history) -> str:
+    """Gemini #3 — cross-session progress note over BigQuery session history.
+
+    `history` is a list of per-session dicts (oldest first), each with at least
+    started_at, sets_count, total_reps, avg_depth, adherence_flag (see
+    bq.query_session_history). Falls back to a structured templated summary when
+    Gemini is unavailable or errors. NEVER returns None.
+    """
+    fallback = _progress_fallback(history)
+    genai = _client()
+    if genai is None or not history:
+        return fallback
+    try:
+        compact = [{
+            "started_at": s.get("started_at"),
+            "sets_count": s.get("sets_count"),
+            "total_reps": s.get("total_reps"),
+            "avg_depth_deg": s.get("avg_depth"),
+            "adherence": bool(s.get("adherence_flag")),
+        } for s in history]
+        prompt = _PROGRESS_REPORT_PROMPT_TEMPLATE.format(
+            history_json=json.dumps(compact, indent=2)[:6000]
+        )
+        model = genai.GenerativeModel(GEMINI_MODEL)
+        response = model.generate_content(prompt)
+        text = (response.text or "").strip()
+    except Exception as e:
+        print(f"[ai_agent] generate_progress_report error: {e}")
+        return fallback
+    return text[:DEBRIEF_CHAR_CAP * 2] or fallback
+
+
 # ---------------------------------------------------------------------------
 # Conversational voice agent.
 # ---------------------------------------------------------------------------
@@ -239,6 +313,8 @@ AGENT_ACTIONS = {
     "none", "start_set", "end_set", "next_set", "end_session",
     # Navigation — lets the patient run the app entirely hands-free.
     "go_checkin", "go_live", "go_debrief", "go_clinician",
+    # Read the full set debrief aloud (server supplies the actual debrief text).
+    "read_debrief",
     # Record a symptom / observation onto the session for the clinician handoff.
     "note",
 }
@@ -258,6 +334,9 @@ You can take ACTIONS by setting the "action" field (infer intent, don't match ex
 - "go_checkin"  : show the check-in screen / "go to check in" / "home".
 - "go_live"     : show the live workout screen / "take me to the workout" / "live view".
 - "go_debrief"  : show the debrief / results screen / "show my results" / "how did the set go" (screen).
+- "read_debrief": the patient wants to HEAR their debrief read aloud — "read my debrief",
+  "play my debrief", "read me my results", "talk me through my set". Leave "speech" empty
+  (or a brief lead-in like "Sure —"); the full debrief is read out automatically.
 - "go_clinician": show the clinician / PT screen / "open the clinician view" / "PT dashboard".
 - "note"        : the patient wants to record a symptom/observation for their PT —
   "note that my right knee hurts", "make a note: felt a twinge", "my knee is sore today".
@@ -302,6 +381,10 @@ def _converse_fallback(text: str) -> dict:
         return {"speech": "Got it — I've noted that for your PT.", "action": "note"}
     if ("session" in t or "workout" in t) and any(w in t for w in ("end", "finish", "done", "wrap")):
         return {"speech": "Wrapping up your session now.", "action": "end_session"}
+    if ("debrief" in t or "results" in t or "summary" in t) and any(
+        w in t for w in ("read", "play", "hear", "tell", "talk")
+    ):
+        return {"speech": "", "action": "read_debrief"}
     if "next" in t:
         return {"speech": "On to the next set.", "action": "next_set"}
     if any(w in t for w in ("start", "ready", "let's go", "lets go", "begin", "go ahead")):

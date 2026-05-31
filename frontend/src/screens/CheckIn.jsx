@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react"
+import { useState, useEffect, useCallback, useRef } from "react"
 import Card from "../components/Card"
 import Chip from "../components/Chip"
 import PrimaryButton from "../components/PrimaryButton"
@@ -48,10 +48,6 @@ function CheckInFlow({ setScreen, switchToIntake, workout, setWorkout, setWorkou
   const [kneeScore, setKneeScore] = useState(null)
   const [pain, setPain] = useState(null)
 
-  // IMU sensor fusion toggle. On (default) keeps tracking your depth when the
-  // camera loses sight of the leg; off runs camera-only.
-  const [useIMU, setUseIMU] = useState(true)
-
   // ── Exercise catalogue + workout builder ───────────────────────────
   const [exercises, setExercises] = useState([])
   const [exLoadError, setExLoadError] = useState(null)
@@ -63,6 +59,8 @@ function CheckInFlow({ setScreen, switchToIntake, workout, setWorkout, setWorkou
   const [generating, setGenerating] = useState(false)
   const [genError, setGenError] = useState(null)
   const [genSuccess, setGenSuccess] = useState(null)
+  const [pdfName, setPdfName] = useState(null)
+  const fileRef = useRef(null)
 
   // Fetch the catalogue of exercises.
   const fetchExercises = useCallback(async () => {
@@ -101,6 +99,25 @@ function CheckInFlow({ setScreen, switchToIntake, workout, setWorkout, setWorkou
     [setWorkout]
   )
 
+  // Apply the response from either /exercise/load (text) or /exercise/load_pdf.
+  const applyLoadResponse = useCallback(async (res) => {
+    const data = await res.json().catch(() => ({}))
+    if (res.ok && data?.source === "generated") {
+      // Re-fetch the catalogue, then pre-select the newly loaded exercise.
+      const refreshed = await fetchExercises()
+      const newId = data?.active ?? refreshed?.active ?? data?.spec?.id ?? null
+      if (newId) setPickId(newId)
+      const name = data?.spec?.display_name || newId || "exercise"
+      setGenSuccess(`Loaded "${name}" — add it to your workout below.`)
+      setGenError(null)
+    } else {
+      setGenError(
+        data?.detail || data?.error ||
+          "Couldn't generate an exercise from that document. Try adding more detail."
+      )
+    }
+  }, [fetchExercises])
+
   // Generate a new exercise spec from pasted documentation.
   const handleGenerate = useCallback(async () => {
     const text = docText.trim()
@@ -114,27 +131,33 @@ function CheckInFlow({ setScreen, switchToIntake, workout, setWorkout, setWorkou
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text }),
       })
-      const data = await res.json().catch(() => ({}))
-      if (data?.source === "generated") {
-        // Re-fetch the catalogue, then pre-select the newly loaded exercise.
-        const refreshed = await fetchExercises()
-        const newId = data?.active ?? refreshed?.active ?? data?.spec?.id ?? null
-        if (newId) setPickId(newId)
-        const name = data?.spec?.display_name || newId || "exercise"
-        setGenSuccess(`Loaded "${name}" — add it to your workout below.`)
-        setGenError(null)
-      } else {
-        setGenError(
-          data?.error ||
-            "Couldn't generate an exercise from that text. Try adding more detail."
-        )
-      }
+      await applyLoadResponse(res)
     } catch {
       setGenError("Something went wrong while generating. Please try again.")
     } finally {
       setGenerating(false)
     }
-  }, [docText, generating, fetchExercises])
+  }, [docText, generating, applyLoadResponse])
+
+  // Generate a new exercise spec from an uploaded PDF prescription.
+  const handlePdf = useCallback(async (file) => {
+    if (!file || generating) return
+    setPdfName(file.name)
+    setGenerating(true)
+    setGenError(null)
+    setGenSuccess(null)
+    try {
+      const form = new FormData()
+      form.append("file", file)
+      const res = await fetch("/exercise/load_pdf", { method: "POST", body: form })
+      await applyLoadResponse(res)
+    } catch {
+      setGenError("Couldn't read that PDF. Please try another file.")
+    } finally {
+      setGenerating(false)
+      if (fileRef.current) fileRef.current.value = ""
+    }
+  }, [generating, applyLoadResponse])
 
   // Begin the session: install the first exercise + its rep target, then go live.
   // If the user hasn't explicitly "added" anything yet, fall back to whatever's
@@ -148,13 +171,14 @@ function CheckInFlow({ setScreen, switchToIntake, workout, setWorkout, setWorkou
       setWorkout(plan)
     }
     const first = plan[0]
-    send({ cmd: "set_imu", enabled: useIMU })
+    // Camera-only tracking — no IMU hardware in this build.
+    send({ cmd: "set_imu", enabled: false })
     send({ cmd: "select_exercise", id: first.id })
     send({ cmd: "reset_set", rep_target: first.reps })
     send({ cmd: "start_set" })
     setWorkoutPos({ ex: 0, set: 1 })
     setScreen("live")
-  }, [workout, exercises, pickId, pickSets, pickReps, useIMU, send, setWorkout, setWorkoutPos, setScreen])
+  }, [workout, exercises, pickId, pickSets, pickReps, send, setWorkout, setWorkoutPos, setScreen])
 
   // The session can start once there's either a built plan or a valid pick.
   const canStart = workout.length > 0 || !!pickId
@@ -306,19 +330,66 @@ function CheckInFlow({ setScreen, switchToIntake, workout, setWorkout, setWorkou
               docOpen ? "rotate-90" : ""
             }`}
           />
-          New exercise from documentation
+          New exercise from a PT prescription
         </button>
 
         {docOpen && (
           <div className="mt-3 flex flex-col gap-3">
-            <textarea
-              value={docText}
-              onChange={(e) => setDocText(e.target.value)}
-              placeholder="Paste exercise instructions or notes from your PT…"
-              rows={4}
-              disabled={generating}
-              className="w-full px-3 py-2 rounded-lg border border-hair bg-white text-sm text-ink placeholder:text-ink-faint resize-none focus:outline-none focus:ring-1 focus:ring-brand disabled:opacity-50"
+            {/* Primary: upload a PDF prescription */}
+            <input
+              ref={fileRef}
+              type="file"
+              accept="application/pdf,.pdf"
+              className="hidden"
+              onChange={(e) => handlePdf(e.target.files?.[0])}
             />
+            <button
+              type="button"
+              onClick={() => fileRef.current?.click()}
+              disabled={generating}
+              className="flex flex-col items-center justify-center gap-2 w-full rounded-xl border-2 border-dashed border-hair bg-white px-4 py-6 text-center transition-colors hover:border-brand/50 hover:bg-brand-bg/30 disabled:opacity-50"
+            >
+              <i className="ti ti-file-type-pdf text-2xl text-brand" />
+              <span className="text-sm font-medium text-ink">
+                {pdfName ? pdfName : "Upload a prescription PDF"}
+              </span>
+              <span className="text-xs text-ink-faint">
+                We read the exercise, sets, reps and depth straight from your PT's sheet.
+              </span>
+            </button>
+            <a
+              href="/static/sample-prescription.pdf"
+              target="_blank"
+              rel="noreferrer"
+              className="text-xs text-brand hover:underline self-center"
+            >
+              Don't have one? Download a sample prescription PDF
+            </a>
+
+            {/* Secondary: paste text instead */}
+            <details className="text-xs text-ink-faint">
+              <summary className="cursor-pointer hover:text-ink-soft">Or paste the text instead</summary>
+              <textarea
+                value={docText}
+                onChange={(e) => setDocText(e.target.value)}
+                placeholder="Paste exercise instructions or notes from your PT…"
+                rows={4}
+                disabled={generating}
+                className="mt-2 w-full px-3 py-2 rounded-lg border border-hair bg-white text-sm text-ink placeholder:text-ink-faint resize-none focus:outline-none focus:ring-1 focus:ring-brand disabled:opacity-50"
+              />
+              <div className="flex justify-end mt-2">
+                <PrimaryButton
+                  onClick={handleGenerate}
+                  className={
+                    !docText.trim() || generating
+                      ? "opacity-50 pointer-events-none"
+                      : ""
+                  }
+                >
+                  {generating ? "Generating…" : "Generate & load"}
+                </PrimaryButton>
+              </div>
+            </details>
 
             {genSuccess && (
               <div className="flex items-start gap-2 rounded-lg bg-ok-bg p-3">
@@ -332,19 +403,6 @@ function CheckInFlow({ setScreen, switchToIntake, workout, setWorkout, setWorkou
                 <p className="text-xs text-ink-soft">{genError}</p>
               </div>
             )}
-
-            <div className="flex justify-end">
-              <PrimaryButton
-                onClick={handleGenerate}
-                className={
-                  !docText.trim() || generating
-                    ? "opacity-50 pointer-events-none"
-                    : ""
-                }
-              >
-                {generating ? "Generating…" : "Generate & load"}
-              </PrimaryButton>
-            </div>
           </div>
         )}
 
@@ -385,43 +443,6 @@ function CheckInFlow({ setScreen, switchToIntake, workout, setWorkout, setWorkou
         </div>
       </Card>
 
-      {/* IMU sensor-fusion toggle */}
-      <Card>
-        <button
-          type="button"
-          onClick={() => setUseIMU((v) => !v)}
-          aria-pressed={useIMU}
-          className="flex items-center gap-3 w-full text-left"
-        >
-          <span
-            className={`w-9 h-9 rounded-full flex items-center justify-center shrink-0 transition-colors ${
-              useIMU ? "bg-brand-bg text-brand" : "bg-surface text-ink-faint"
-            }`}
-          >
-            <i className="ti ti-cpu text-lg" />
-          </span>
-          <span className="flex-1 min-w-0">
-            <span className="block text-sm font-medium text-ink">
-              IMU sensor fusion
-            </span>
-            <span className="block text-xs text-ink-soft">
-              Keeps tracking your depth when the camera loses sight of your leg.
-            </span>
-          </span>
-          {/* Switch */}
-          <span
-            className={`relative w-11 h-6 rounded-full shrink-0 transition-colors ${
-              useIMU ? "bg-brand" : "bg-hair"
-            }`}
-          >
-            <span
-              className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform ${
-                useIMU ? "translate-x-5" : "translate-x-0"
-              }`}
-            />
-          </span>
-        </button>
-      </Card>
 
       {/* Footer */}
       <div className="flex items-center justify-between">

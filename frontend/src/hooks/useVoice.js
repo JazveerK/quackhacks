@@ -27,6 +27,10 @@ export default function useVoice({ onFinal, onInterim } = {}) {
   const wantRef = useRef(false)      // user intends to keep listening (auto-restart)
   const speakingRef = useRef(false)  // gate mic input while the coach talks
   const audioRef = useRef(null)
+  // Monotonic token: every speak()/cancelSpeak() bumps it. An async TTS fetch
+  // that resolves after a newer call is discarded, so two cues can never play at
+  // once (which sounded like "two voices" — ElevenLabs + the browser fallback).
+  const speakGenRef = useRef(0)
   // Keep the latest callbacks without re-creating the recognizer each render.
   const finalRef = useRef(onFinal)
   const interimRef = useRef(onInterim)
@@ -94,6 +98,7 @@ export default function useVoice({ onFinal, onInterim } = {}) {
   }, [listening, start, stop])
 
   const cancelSpeak = useCallback(() => {
+    speakGenRef.current += 1   // invalidate any in-flight speak()
     try { audioRef.current?.pause() } catch { /* noop */ }
     audioRef.current = null
     if (typeof window !== 'undefined') window.speechSynthesis?.cancel()
@@ -104,23 +109,33 @@ export default function useVoice({ onFinal, onInterim } = {}) {
   const speak = useCallback(async (text) => {
     if (!text) return
     cancelSpeak()
+    const myGen = speakGenRef.current  // this call's token (set by cancelSpeak)
     speakingRef.current = true
     setSpeaking(true)
 
+    const superseded = () => myGen !== speakGenRef.current
     const done = () => {
+      if (superseded()) return
       speakingRef.current = false
       setSpeaking(false)
       audioRef.current = null
     }
 
+    // Always voice the coach through ElevenLabs (the "coach voice"); the browser
+    // SpeechSynthesis is only a fallback when /tts is unreachable. The myGen
+    // checks make sure a stale fetch result never starts playing after a newer
+    // cue began — that overlap was the "two voices" bug.
     try {
       const res = await fetch('/tts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text }),
       })
+      if (superseded()) return   // a newer cue took over while we awaited
       if (res.ok) {
-        const url = URL.createObjectURL(await res.blob())
+        const blob = await res.blob()
+        if (superseded()) return
+        const url = URL.createObjectURL(blob)
         const audio = new Audio(url)
         audioRef.current = audio
         audio.onended = () => { done(); URL.revokeObjectURL(url) }
@@ -130,8 +145,10 @@ export default function useVoice({ onFinal, onInterim } = {}) {
       }
     } catch { /* fall through to browser TTS */ }
 
-    // Fallback: browser SpeechSynthesis.
+    // Fallback: browser SpeechSynthesis — only if this call is still current.
+    if (superseded()) return
     try {
+      window.speechSynthesis.cancel()  // clear any stray queued utterance
       const u = new SpeechSynthesisUtterance(text)
       u.onend = done
       u.onerror = done

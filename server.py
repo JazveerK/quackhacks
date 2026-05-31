@@ -34,7 +34,7 @@ try:
 except ImportError:
     pass
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -133,7 +133,9 @@ clients: set[WebSocket] = set()
 # ---------------------------------------------------------------------------
 SESSION_ID = uuid.uuid4().hex[:8]
 SESSION_STARTED_AT = datetime.now(timezone.utc)
-SESSION_USER_ID = os.environ.get("PF_USER_ID", "demo_user")
+# Single demo patient id — matches seed_bigquery.py so the live cross-session
+# progress report reasons over the seeded history at the booth.
+SESSION_USER_ID = os.environ.get("PF_USER_ID", "demo-patient")
 set_index = 0
 session_summaries: list[dict] = []
 _session_lock = threading.Lock()
@@ -352,15 +354,29 @@ async def index():
 
 
 # The React build references these from the site root (e.g. <link href="/favicon.svg">),
-# so serve them at root rather than only under /static.
-@app.get("/favicon.svg")
-async def favicon():
-    return FileResponse(STATIC_DIR / "favicon.svg")
+# so serve them at root rather than only under /static. Browsers also auto-request
+# some of these from root regardless of the <link> tags (/favicon.ico,
+# /apple-touch-icon.png), so each needs a root route.
+_ROOT_FILES = {
+    "/favicon.svg": "favicon.svg",
+    "/favicon.ico": "favicon.ico",
+    "/favicon-32.png": "favicon-32.png",
+    "/favicon-96.png": "favicon-96.png",
+    "/apple-touch-icon.png": "apple-touch-icon.png",
+    "/logo.png": "logo.png",
+    "/logo-mark.png": "logo-mark.png",
+    "/icons.svg": "icons.svg",
+}
 
 
-@app.get("/icons.svg")
-async def icons():
-    return FileResponse(STATIC_DIR / "icons.svg")
+def _make_root_file_route(filename: str):
+    async def _route():
+        return FileResponse(STATIC_DIR / filename)
+    return _route
+
+
+for _path, _file in _ROOT_FILES.items():
+    app.add_api_route(_path, _make_root_file_route(_file), methods=["GET"])
 
 
 if STATIC_DIR.exists():
@@ -440,18 +456,14 @@ class ExerciseDoc(BaseModel):
     text: str
 
 
-@app.post("/exercise/load")
-async def load_exercise(payload: ExerciseDoc):
-    """Generate an Exercise Spec from a PT's written documentation (Gemini, ONCE)
-    and install it on the tracker, so the SAME real-time engine now coaches that
-    exercise. The LLM never runs on the per-frame rep path.
-
-    Falls back to the default squat spec (with an `error` message) if generation
-    fails — voice/AI is never load-bearing.
-    """
+async def _generate_and_install_spec(text: str) -> JSONResponse:
+    """Shared path for both text and PDF documentation: generate an Exercise Spec
+    via Gemini (ONCE), validate, register, and install it on the live tracker.
+    The LLM never runs on the per-frame rep path; falls back to the default squat
+    spec (with an `error` message) if generation fails."""
     if tracker is None:
         raise HTTPException(503, "tracker not ready yet")
-    text = (payload.text or "").strip()
+    text = (text or "").strip()
     if not text:
         raise HTTPException(400, "empty documentation")
 
@@ -471,6 +483,48 @@ async def load_exercise(payload: ExerciseDoc):
         "error": result["error"],
         "active": spec.id,
     })
+
+
+def _extract_pdf_text(data: bytes) -> str:
+    """Pull plain text out of an uploaded PDF prescription. Returns "" if the PDF
+    has no extractable text (e.g. a scanned image)."""
+    import io
+    from pypdf import PdfReader
+    try:
+        reader = PdfReader(io.BytesIO(data))
+    except Exception:
+        return ""  # not a valid PDF — caller turns this into a friendly 422
+    pages = []
+    for page in reader.pages:
+        try:
+            pages.append(page.extract_text() or "")
+        except Exception:
+            continue
+    return "\n".join(pages).strip()
+
+
+@app.post("/exercise/load")
+async def load_exercise(payload: ExerciseDoc):
+    """Generate + install an Exercise Spec from pasted PT documentation."""
+    return await _generate_and_install_spec(payload.text or "")
+
+
+@app.post("/exercise/load_pdf")
+async def load_exercise_pdf(file: UploadFile = File(...)):
+    """Same as /exercise/load but the documentation arrives as an uploaded PDF
+    (a PT's prescription sheet). We extract the text, then reuse the exact same
+    generate-and-install path."""
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, "empty file")
+    text = await asyncio.to_thread(_extract_pdf_text, data)
+    if not text:
+        raise HTTPException(
+            422,
+            "Couldn't read any text from that PDF — it may be a scanned image. "
+            "Try a text-based PDF or paste the text instead.",
+        )
+    return await _generate_and_install_spec(text)
 
 
 @app.get("/profile")
@@ -535,7 +589,7 @@ def _build_sts_observation(sid, user_id, started_at, summaries, total_reps,
         "age": _user_context["age"],
         "sex": _user_context["sex_at_birth"],
         "uses_arm_support": False,
-        "tracking_source": "fused",
+        "tracking_source": "camera",
         "tracking_confidence_mean": round(tracking_conf_mean, 3),
         "calibration_id": f"cal-{sid}",
         "mean_concentric_s": round(sum(concentric_vals) / len(concentric_vals), 2) if concentric_vals else 1.0,
@@ -631,8 +685,29 @@ def _finalize_session() -> dict:
         sts_observation=sts_obs,
     )
 
-    # Gemini progress report (gracefully degrades to None).
+    # Gemini #2 — this-session debrief over the current session's sets
+    # (gracefully degrades to None).
     report = ai_agent.generate_session_report(active_profile, summaries)
+
+    # Gemini #3 — CROSS-SESSION progress report over BigQuery history.
+    # Streaming-insert delay means the row we just wrote isn't queryable yet, so
+    # pull PRIOR sessions from BQ and append THIS session's numbers locally
+    # (never read-after-write). Always returns text (templated fallback).
+    try:
+        prior = bq.query_session_history(user_id)
+        current = {
+            "session_id": sid,
+            "started_at": started_at.isoformat(),
+            "exercise": "bodyweight_squat",
+            "sets_count": sets_count,
+            "total_reps": total_reps,
+            "avg_depth": avg_depth,
+            "adherence_flag": all_targets_hit,
+        }
+        progress_report = ai_agent.generate_progress_report(prior + [current])
+    except Exception as e:
+        print(f"[server] progress_report failed: {e}")
+        progress_report = None
 
     # Rotate to a fresh session_id so subsequent sets start clean.
     _new_session()
@@ -645,6 +720,7 @@ def _finalize_session() -> dict:
         "avg_depth": avg_depth,
         "adherence_flag": adherence_flag,
         "report": report,
+        "progress_report": progress_report,
         "share_url": share_url,
         "sts_observation": sts_obs,
         "patient_notes": [n["text"] for n in notes],
@@ -666,6 +742,29 @@ async def sets_recent(limit: int = 50):
     """
     rows = bq.query_recent_sets(limit=max(1, min(int(limit), 500)))
     return JSONResponse({"rows": rows, "bq_available": bq.is_available()})
+
+
+@app.get("/pt/overview")
+async def pt_overview(user_id: str = ""):
+    """View B (PT) cross-session overview from BigQuery: per-session ROM/adherence
+    trend over time PLUS the Gemini #3 progress report reasoning over that history.
+
+    Reads only history (off the realtime path). Degrades gracefully: if BigQuery
+    is unreachable, `sessions` is [] and the UI falls back to the set-level view;
+    `progress_report` always has text (templated when Gemini/BQ is unavailable).
+    """
+    uid = (user_id or SESSION_USER_ID).strip() or SESSION_USER_ID
+    sessions = await asyncio.to_thread(bq.query_session_history, uid)
+    report = await asyncio.to_thread(ai_agent.generate_progress_report, sessions)
+    expected = int(getattr(tracker.profile, "sets", 0) or 0) if tracker is not None else 0
+    return JSONResponse({
+        "user_id": uid,
+        "sessions": sessions,
+        "progress_report": report,
+        "expected_sessions": len(sessions),  # adherence denominator = sessions on record
+        "prescribed_sets_per_session": expected,
+        "bq_available": bq.is_available(),
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -790,6 +889,15 @@ async def _handle_voice(text: str) -> None:
                 "phase": tracker.phase if tracker is not None else None,
             })
         payload["note_count"] = len(session_notes)
+    elif action == "read_debrief":
+        # The LLM speech is capped to a sentence, so the coach can't recite the
+        # whole debrief — inject the actual generated debrief text to be spoken.
+        snap = bridge.snapshot()
+        debrief = (snap.get("ai_debrief") or {}).get("text")
+        if debrief:
+            payload["text"] = f"{speech} {debrief}".strip() if speech else debrief
+        elif not speech:
+            payload["text"] = "I don't have a debrief yet — finish a set and I'll talk you through it."
     elif action == "next_set":
         tracker.reset_set()
         bridge.push_profile(tracker.profile, source=tracker.profile.source)

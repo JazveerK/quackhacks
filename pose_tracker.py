@@ -522,8 +522,13 @@ class RepCounter:
             self._t_last_standing = now
 
         if s.phase == "up":
-            # Enter the active phase once we pass the trigger toward the peak.
-            if sgn * angle > sgn * self.trigger_angle:
+            # Enter the active phase once we pass the trigger toward the peak —
+            # but only after we've actually seen the user standing/extended at
+            # least once this set. `_t_last_standing` is 0.0 on a fresh counter
+            # and is set above the moment a resting frame arrives, so a normal
+            # "stand, then squat" still arms instantly. This stops pose jitter at
+            # SET_ACTIVE onset from logging 1-2 phantom reps before the first squat.
+            if sgn * angle > sgn * self.trigger_angle and self._t_last_standing > 0:
                 self._down_streak += 1
             else:
                 self._down_streak = 0

@@ -25,6 +25,8 @@ export default defineConfig({
       '/share': 'http://127.0.0.1:8000',
       '/user-context': 'http://127.0.0.1:8000',
       '/sets': 'http://127.0.0.1:8000',
+      '/pt': 'http://127.0.0.1:8000',
+      '/exercises': 'http://127.0.0.1:8000',
     },
     // Move Vite's own HMR websocket off /ws to avoid collision
     hmr: {

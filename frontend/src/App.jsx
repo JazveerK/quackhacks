@@ -119,7 +119,7 @@ export default function App() {
       )}
 
       {/* Hands-free voice assistant — available on all screens */}
-      <VoiceAssistant setScreen={setScreen} />
+      <VoiceAssistant setScreen={setScreen} screen={screen} />
     </div>
   )
 }

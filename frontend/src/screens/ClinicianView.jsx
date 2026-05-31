@@ -7,11 +7,12 @@ import Pill from "../components/Pill"
 
 const TARGET_DEG = 90
 const CHART_MIN = 85
-const CHART_MAX = 115
+const CHART_MAX = 120
 
 // ── Defensive readers (BigQuery rows may be flatter than in-memory) ───
+// A row is a SESSION (cross-session history) or a SET (single-session fallback).
 function depthMean(r) {
-  const v = r?.analysis?.depth?.mean_deg ?? r?.avg_depth_deg ?? r?.avg_depth ?? null
+  const v = r?.avg_depth ?? r?.analysis?.depth?.mean_deg ?? r?.avg_depth_deg ?? null
   return v == null ? null : Number(v)
 }
 function hitRate(r) {
@@ -29,7 +30,7 @@ function setScore(r) {
   return v == null ? null : Number(v)
 }
 function repsCompleted(r) {
-  const v = r?.reps_completed ?? r?.reps ?? null
+  const v = r?.total_reps ?? r?.reps_completed ?? r?.reps ?? null
   return v == null ? null : Number(v)
 }
 function repTarget(r) {
@@ -52,14 +53,37 @@ function fatigue(r) {
   }
   return null
 }
-function setIndex(r, i) {
-  // BQ set_index is 1-based; in-memory set_index is also 1-based.
+// Label for the X axis: a date for sessions, else "Set N".
+function pointLabel(r, i, mode) {
+  if (mode === "sessions") {
+    const ts = r?.started_at
+    if (ts) {
+      const d = new Date(ts)
+      if (!Number.isNaN(d.getTime())) {
+        return d.toLocaleDateString(undefined, { month: "short", day: "numeric" })
+      }
+    }
+    return `Session ${i + 1}`
+  }
   const v = r?.set_index
-  return v == null ? i + 1 : Number(v)
+  return `Set ${v == null ? i + 1 : Number(v)}`
+}
+// A session counts as adherent if its boolean flag is true; a set counts when
+// reps met the target. Returns "done" | "partial" | "missed".
+function adherenceStatus(r, mode) {
+  if (mode === "sessions") {
+    return r?.adherence_flag ? "done" : "partial"
+  }
+  const done = repsCompleted(r)
+  const tgt = repTarget(r)
+  if (done == null || tgt == null || tgt === 0) return "partial"
+  if (done >= tgt) return "done"
+  if (done <= 0) return "missed"
+  return "partial"
 }
 
-// ── SVG line chart (depth + score, real data) ────────────────────────
-function DepthTrendChart({ rows }) {
+// ── SVG line chart (depth over time, real data) ──────────────────────
+function DepthTrendChart({ rows, mode }) {
   const w = 600
   const h = 200
   const pad = { t: 24, r: 16, b: 28, l: 36 }
@@ -81,7 +105,7 @@ function DepthTrendChart({ rows }) {
   const xStep = depthPts.length > 1 ? cw / (depthPts.length - 1) : 0
   // Clamp into the visible band so outliers stay on-chart.
   const clamp = (v) => Math.min(CHART_MAX, Math.max(CHART_MIN, v))
-  // Inverted: lower degree = higher on chart (improvement rises)
+  // Inverted: lower degree = higher on chart (improvement rises).
   const yScale = (deg) => pad.t + ((clamp(deg) - CHART_MIN) / (CHART_MAX - CHART_MIN)) * ch
   const targetDeg =
     targetDepth(rows[rows.length - 1]) ?? targetDepth(rows[0]) ?? TARGET_DEG
@@ -90,7 +114,7 @@ function DepthTrendChart({ rows }) {
   const points = depthPts.map((p, idx) => ({
     x: pad.l + (depthPts.length > 1 ? idx * xStep : cw / 2),
     y: yScale(p.deg),
-    label: `Set ${setIndex(rows[p.i], p.i)}`,
+    label: pointLabel(rows[p.i], p.i, mode),
     score: setScore(rows[p.i]),
   }))
 
@@ -123,22 +147,22 @@ function DepthTrendChart({ rows }) {
           r="3"
           fill={p.score != null && p.score < 60 ? "var(--color-warn)" : "var(--color-brand)"}
         >
-          <title>{`${p.label}${p.score != null ? ` · score ${Math.round(p.score)}` : ""}`}</title>
+          <title>{`${p.label}${p.score != null ? ` · score ${Math.round(p.score)}` : ""} · ${Math.round(depthPts[i].deg)}°`}</title>
         </circle>
       ))}
 
-      {/* X labels (every set if few, else every 3rd) */}
+      {/* X labels (every point if few, else thinned) */}
       {points.map((p, i) => {
-        const every = points.length > 8 ? 3 : 1
+        const every = points.length > 8 ? Math.ceil(points.length / 8) : 1
         return i % every === 0 ? (
           <text key={i} x={p.x} y={h - 4} fontSize="9" fill="var(--color-ink-faint)" textAnchor="middle">
-            {p.label.replace("Set ", "S")}
+            {p.label}
           </text>
         ) : null
       })}
 
       {/* Y labels */}
-      {[90, 95, 100, 105, 110].map((deg) => (
+      {[90, 100, 110, 120].map((deg) => (
         <text key={deg} x={pad.l - 6} y={yScale(deg) + 3} fontSize="9" fill="var(--color-ink-faint)" textAnchor="end">
           {deg}°
         </text>
@@ -147,23 +171,21 @@ function DepthTrendChart({ rows }) {
   )
 }
 
-// ── Adherence: one cell per set, driven by reps vs target ────────────
-function AdherenceHeatmap({ rows }) {
-  // status per set: "done" (>=100%) | "partial" (some) | "missed" (0 / none)
+// ── Adherence: one cell per session/set ──────────────────────────────
+function AdherenceHeatmap({ rows, mode }) {
   const cells = rows.map((r, i) => {
-    const done = repsCompleted(r)
-    const tgt = repTarget(r)
-    let status
-    if (done == null || tgt == null || tgt === 0) status = "partial"
-    else if (done >= tgt) status = "done"
-    else if (done <= 0) status = "missed"
-    else status = "partial"
-    return {
-      status,
-      label: `Set ${setIndex(r, i)}`,
-      detail:
-        done != null && tgt != null ? `${done}/${tgt} reps` : "—",
+    const status = adherenceStatus(r, mode)
+    let detail
+    if (mode === "sessions") {
+      const sets = r?.sets_count
+      const reps = repsCompleted(r)
+      detail = `${sets != null ? `${sets} sets` : ""}${reps != null ? ` · ${reps} reps` : ""}`.trim() || "—"
+    } else {
+      const done = repsCompleted(r)
+      const tgt = repTarget(r)
+      detail = done != null && tgt != null ? `${done}/${tgt} reps` : "—"
     }
+    return { status, label: pointLabel(r, i, mode), detail }
   })
 
   const cellColor = { done: "bg-ok", partial: "bg-warn", missed: "bg-warn" }
@@ -198,21 +220,22 @@ function AdherenceHeatmap({ rows }) {
       {/* Legend */}
       <div className="flex items-center gap-4 text-[10px] text-ink-faint">
         <span className="flex items-center gap-1.5">
-          <span className="w-3 h-3 rounded bg-ok" /> Completed
+          <span className="w-3 h-3 rounded bg-ok" /> {mode === "sessions" ? "Completed session" : "Completed"}
         </span>
         <span className="flex items-center gap-1.5">
-          <span className="w-3 h-3 rounded bg-warn" /> Partial / missed
+          <span className="w-3 h-3 rounded bg-warn" /> {mode === "sessions" ? "Incomplete session" : "Partial / missed"}
         </span>
       </div>
     </div>
   )
 }
 
-// ── Derive flagged patterns from real signals ────────────────────────
-function deriveFlags(rows) {
+// ── Derive flagged patterns from real signals (set-level only) ────────
+function deriveFlags(rows, mode) {
+  if (mode === "sessions") return [] // session rows don't carry per-rep signals
   const flags = []
   rows.forEach((r, i) => {
-    const n = setIndex(r, i)
+    const n = r?.set_index == null ? i + 1 : Number(r.set_index)
     const f = fatigue(r)
     if (f && f !== "none") {
       flags.push({ text: `Fatigue signal "${f}" detected in set ${n}`, set: n })
@@ -252,13 +275,36 @@ export default function ClinicianView() {
   const [toast, setToast] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
-  const [rows, setRows] = useState([])        // chart/adherence/flag source
+  const [rows, setRows] = useState([])          // chart/adherence source
+  const [mode, setMode] = useState("sets")      // "sessions" | "sets"
   const [sourceLabel, setSourceLabel] = useState("")
+  const [progressReport, setProgressReport] = useState("") // Gemini #3 cross-session
+  const [profile, setProfile] = useState(null)
+  const [exerciseName, setExerciseName] = useState(null)
+  const [sessionId, setSessionId] = useState(null)
 
   const showToast = useCallback((msg) => {
     setToast(msg)
     setTimeout(() => setToast(null), 3000)
   }, [])
+
+  const handleExport = useCallback(() => {
+    window.print()
+  }, [])
+
+  const handleShare = useCallback(async () => {
+    if (!sessionId) {
+      showToast("No active session to share yet")
+      return
+    }
+    const url = `${window.location.origin}/share/${sessionId}`
+    try {
+      await navigator.clipboard.writeText(url)
+      showToast("Handoff link copied to clipboard")
+    } catch {
+      window.prompt("Copy this clinician handoff link:", url)
+    }
+  }, [sessionId, showToast])
 
   useEffect(() => {
     let cancelled = false
@@ -267,15 +313,24 @@ export default function ClinicianView() {
       setLoading(true)
       setError(null)
 
-      // Prefer cross-session history from BigQuery; fall back to the
-      // current in-memory session. Never let one failure kill the view.
+      // 1) PREFER cross-session history from BigQuery (the real PT product value):
+      //    per-session ROM/adherence trend + the Gemini progress report.
+      let overview = null
+      try {
+        const res = await fetch("/pt/overview")
+        if (res.ok) overview = await res.json()
+      } catch {
+        /* fall through to set-level */
+      }
+
+      // 2) Fallback source: recent sets (single-session granularity).
       let recent = null
-      let bq = false
+      let bqSets = false
       try {
         const res = await fetch("/sets/recent?limit=50")
         if (res.ok) {
           const data = await res.json()
-          bq = !!data.bq_available
+          bqSets = !!data.bq_available
           if (Array.isArray(data.rows)) recent = data.rows
         }
       } catch {
@@ -290,15 +345,44 @@ export default function ClinicianView() {
         /* may be unavailable */
       }
 
+      // The active PT prescription (patient name, condition, sets/reps/depth).
+      try {
+        const res = await fetch("/profile")
+        if (res.ok) {
+          const data = await res.json()
+          if (!cancelled && data?.profile) setProfile(data.profile)
+        }
+      } catch {
+        /* fall back to defaults in the render */
+      }
+
+      // The exercise currently installed on the tracker.
+      try {
+        const res = await fetch("/exercises")
+        if (res.ok) {
+          const data = await res.json()
+          const active = (data?.exercises || []).find((e) => e.id === data?.active)
+          if (!cancelled && active?.display_name) setExerciseName(active.display_name)
+        }
+      } catch {
+        /* prescription line falls back to a generic label */
+      }
+
       if (cancelled) return
 
-      // Decide which set list drives the views.
+      if (session?.session_id) setSessionId(session.session_id)
+
+      // Decide which list drives the views. Session history wins when present.
       let chosen = []
+      let chosenMode = "sets"
       let label = ""
-      if (bq && Array.isArray(recent) && recent.length > 0) {
-        // BigQuery rows arrive newest-first; show oldest→newest for trend.
-        chosen = [...recent].reverse()
+      if (overview && Array.isArray(overview.sessions) && overview.sessions.length > 0) {
+        chosen = overview.sessions // already oldest→newest
+        chosenMode = "sessions"
         label = "cross-session history"
+      } else if (bqSets && Array.isArray(recent) && recent.length > 0) {
+        chosen = [...recent].reverse() // BQ rows newest-first; show oldest→newest
+        label = "recent sets"
       } else if (session && Array.isArray(session.summaries) && session.summaries.length > 0) {
         chosen = session.summaries
         label = "current session"
@@ -308,9 +392,12 @@ export default function ClinicianView() {
       }
 
       setRows(chosen)
+      setMode(chosenMode)
       setSourceLabel(label)
+      // Gemini #3 progress report — always text from the backend (templated fallback).
+      setProgressReport(overview?.progress_report || "")
 
-      if (!chosen.length && recent == null && session == null) {
+      if (!chosen.length && !overview && recent == null && session == null) {
         setError("Could not reach the session backend.")
       }
       setLoading(false)
@@ -328,25 +415,41 @@ export default function ClinicianView() {
   const tgt = targetDepth(rows[rows.length - 1]) ?? TARGET_DEG
   const toTarget = lastDepth != null ? Math.max(0, Math.round(lastDepth - tgt)) : null
 
-  const completedSets = rows.filter((r) => {
-    const d = repsCompleted(r)
-    const t = repTarget(r)
-    return d != null && t != null && t > 0 && d >= t
-  }).length
-  const adherencePct = rows.length ? Math.round((completedSets / rows.length) * 100) : null
+  const completedCount = rows.filter((r) => adherenceStatus(r, mode) === "done").length
+  const adherencePct = rows.length ? Math.round((completedCount / rows.length) * 100) : null
 
-  const flags = deriveFlags(rows)
+  const flags = deriveFlags(rows, mode)
   const hasData = rows.length > 0
+  const unit = mode === "sessions" ? "Sessions" : "Sets"
+
+  // ── Patient + prescription, from the real active profile ────────────
+  const patientName = profile?.patient_name || "Patient"
+  const initials =
+    patientName
+      .split(/\s+/)
+      .map((w) => w[0])
+      .filter(Boolean)
+      .slice(0, 2)
+      .join("")
+      .toUpperCase() || "PT"
+  const condition = profile?.condition || ""
+  const fromPT = profile?.source === "parsed" || profile?.source === "uploaded"
+  const rxName = exerciseName || "Bodyweight squat"
+  const rxSets = profile?.sets ?? 3
+  const rxReps = profile?.reps_per_set ?? repTarget(rows[0]) ?? 10
+  const rxDepth = profile?.depth_deg != null ? Math.round(profile.depth_deg) : Math.round(tgt)
+  const rxTempo = profile?.tempo_sec ?? null
+  const rxFocus = profile?.focus || ""
 
   return (
     <div className="flex flex-col gap-4">
       {/* Action buttons row */}
       <div className="flex items-center justify-end gap-3">
-        <GhostButton onClick={() => showToast("Progress report exported as PDF")}>
+        <GhostButton onClick={handleExport}>
           <i className="ti ti-file-export text-base" />
           Export PDF
         </GhostButton>
-        <PrimaryButton onClick={() => showToast("Report sent to Dr. Aisha Patel")}>
+        <PrimaryButton onClick={handleShare}>
           <i className="ti ti-send text-base" />
           Share with PT
         </PrimaryButton>
@@ -355,12 +458,12 @@ export default function ClinicianView() {
       {/* Patient bar */}
       <Card className="flex items-center gap-4">
         <div className="w-11 h-11 rounded-full bg-brand-bg text-brand flex items-center justify-center text-sm font-semibold shrink-0">
-          JM
+          {initials}
         </div>
         <div className="flex-1">
-          <h2 className="text-base font-semibold text-ink">Jordan M.</h2>
+          <h2 className="text-base font-semibold text-ink">{patientName}</h2>
           <p className="text-xs text-ink-soft mt-0.5">
-            Right knee · post-ACL reconstruction · week 6 of 12 · PT: Dr. Aisha Patel
+            {condition || "No condition on file"}
           </p>
         </div>
         {sourceLabel && (
@@ -376,11 +479,11 @@ export default function ClinicianView() {
       ) : !hasData ? (
         <Card className="flex flex-col items-center justify-center py-12 gap-2 text-center">
           <i className="ti ti-clipboard-off text-ink-faint text-2xl" />
-          <p className="text-sm font-medium text-ink">No sessions recorded yet</p>
+          <p className="text-sm font-medium text-ink">No history yet</p>
           <p className="text-xs text-ink-soft">
             {error
               ? error
-              : "Completed sets will appear here once a session is recorded."}
+              : "Completed sessions will appear here once a workout is recorded."}
           </p>
         </Card>
       ) : (
@@ -395,7 +498,7 @@ export default function ClinicianView() {
               />
             </Card>
             <Card>
-              <MetricTile label="Sets" value={rows.length} />
+              <MetricTile label={unit} value={rows.length} />
             </Card>
             <Card>
               <span className="text-xs text-ink-faint uppercase tracking-wide">ROM gain</span>
@@ -418,54 +521,75 @@ export default function ClinicianView() {
 
           {/* Depth trend chart */}
           <Card>
-            <h3 className="text-sm font-medium text-ink mb-3">Squat depth trend</h3>
-            <DepthTrendChart rows={rows} />
+            <h3 className="text-sm font-medium text-ink mb-3">
+              {mode === "sessions" ? "Range-of-motion trend (per session)" : "Squat depth trend"}
+            </h3>
+            <DepthTrendChart rows={rows} mode={mode} />
           </Card>
 
           {/* Adherence heatmap */}
           <Card>
             <h3 className="text-sm font-medium text-ink mb-3">Adherence</h3>
-            <AdherenceHeatmap rows={rows} />
+            <AdherenceHeatmap rows={rows} mode={mode} />
           </Card>
 
-          {/* Progress report */}
+          {/* Progress report — Gemini #3 cross-session, with computed fallback */}
           <Card>
             <div className="flex items-center gap-2 mb-3">
               <i className="ti ti-sparkles text-brand text-lg" />
               <h3 className="text-sm font-medium text-ink">Progress report</h3>
+              {progressReport && mode === "sessions" && (
+                <Pill variant="brand">AI · cross-session</Pill>
+              )}
             </div>
-            <p className="text-sm text-ink-soft leading-relaxed mb-4">
-              {rows.length} set{rows.length === 1 ? "" : "s"} recorded
-              {sourceLabel ? ` (${sourceLabel})` : ""}.{" "}
-              {romGain != null && firstDepth != null && lastDepth != null
-                ? `Average squat depth moved from ${Math.round(firstDepth)}° to ${Math.round(
-                    lastDepth
-                  )}°, a change of ${romGain > 0 ? "+" : ""}${romGain}° toward the ${Math.round(
-                    tgt
-                  )}° target. `
-                : ""}
-              {adherencePct != null
-                ? `${completedSets} of ${rows.length} sets reached the prescribed rep count (${adherencePct}% adherence). `
-                : ""}
-              {flags.length
-                ? "Flagged patterns below highlight sets that may warrant attention."
-                : "No notable issues were flagged across these sets."}
-            </p>
-            <h4 className="text-xs font-medium text-ink-faint uppercase tracking-wide mb-2">
-              Flagged patterns
-            </h4>
-            {flags.length ? (
-              <ul className="flex flex-col gap-2">
-                {flags.map((f, i) => (
-                  <li key={i} className="flex items-center gap-2 text-sm text-ink-soft">
-                    <i className="ti ti-alert-circle text-warn text-sm shrink-0" />
-                    <span className="flex-1">{f.text}</span>
-                    <Pill variant="warn">Set {f.set}</Pill>
-                  </li>
-                ))}
-              </ul>
+            {progressReport ? (
+              <p className="text-sm text-ink-soft leading-relaxed mb-4 whitespace-pre-line">
+                {progressReport}
+              </p>
             ) : (
-              <p className="text-sm text-ink-soft">No patterns flagged.</p>
+              <p className="text-sm text-ink-soft leading-relaxed mb-4">
+                {rows.length} {unit.toLowerCase()} recorded
+                {sourceLabel ? ` (${sourceLabel})` : ""}.{" "}
+                {romGain != null && firstDepth != null && lastDepth != null
+                  ? `Average squat depth moved from ${Math.round(firstDepth)}° to ${Math.round(
+                      lastDepth
+                    )}°, a change of ${romGain > 0 ? "+" : ""}${romGain}° toward the ${Math.round(
+                      tgt
+                    )}° target. `
+                  : ""}
+                {adherencePct != null
+                  ? `${completedCount} of ${rows.length} ${unit.toLowerCase()} met the prescription (${adherencePct}% adherence). `
+                  : ""}
+                {flags.length
+                  ? "Flagged patterns below highlight sets that may warrant attention."
+                  : "No notable issues were flagged."}
+              </p>
+            )}
+            {progressReport && mode === "sessions" && (
+              <p className="flex items-center gap-1.5 text-[11px] text-ink-faint mb-4">
+                <i className="ti ti-sparkles text-xs" />
+                Generated by Gemini 2.5 Flash over your BigQuery session history
+              </p>
+            )}
+            {mode !== "sessions" && (
+              <>
+                <h4 className="text-xs font-medium text-ink-faint uppercase tracking-wide mb-2">
+                  Flagged patterns
+                </h4>
+                {flags.length ? (
+                  <ul className="flex flex-col gap-2">
+                    {flags.map((f, i) => (
+                      <li key={i} className="flex items-center gap-2 text-sm text-ink-soft">
+                        <i className="ti ti-alert-circle text-warn text-sm shrink-0" />
+                        <span className="flex-1">{f.text}</span>
+                        <Pill variant="warn">Set {f.set}</Pill>
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="text-sm text-ink-soft">No patterns flagged.</p>
+                )}
+              </>
             )}
           </Card>
 
@@ -474,12 +598,15 @@ export default function ClinicianView() {
             <div>
               <div className="flex items-center gap-2 mb-1">
                 <h3 className="text-sm font-medium text-ink">Current prescription</h3>
-                <Pill variant="brand">set by PT</Pill>
+                <Pill variant="brand">{fromPT ? "set by PT" : "demo profile"}</Pill>
               </div>
               <p className="text-sm text-ink-soft">
-                Bodyweight squat · {rows.length || 3} sets ×{" "}
-                {repTarget(rows[0]) ?? 10} · target {Math.round(tgt)}° · 5×/week
+                {rxName} · {rxSets} sets × {rxReps} · target {rxDepth}°
+                {rxTempo != null ? ` · ${rxTempo}s tempo` : ""}
               </p>
+              {rxFocus && (
+                <p className="text-xs text-ink-faint mt-1">Focus: {rxFocus}</p>
+              )}
             </div>
             <i className="ti ti-lock text-ink-faint text-lg mt-0.5" />
           </Card>

@@ -14,7 +14,7 @@
   --color-ok: #0f6e56;
   --color-ok-bg: #e1f5ee;
 
-  /* Warn / caution — shallow, "IMU holding" */
+  /* Warn / caution — shallow depth, degraded tracking */
   --color-warn: #8a5210;
   --color-warn-bg: #faeeda;
 
@@ -30,9 +30,10 @@
   --radius-lg: 12px;
   --radius-md: 8px;
 
-  /* Fonts */
-  --font-sans: "Inter", system-ui, sans-serif;
-  --font-mono: ui-monospace, Menlo, monospace;
+  /* Fonts — Inter is now actually loaded (self-hosted via @fontsource-variable/inter
+     in main.jsx); it previously fell back silently to the system font. */
+  --font-sans: "Inter Variable", "Inter", system-ui, -apple-system, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, monospace;
 }
 
 html, body, #root { height: 100%; }
@@ -41,8 +42,15 @@ body {
   background: #faf9f5;
   color: var(--color-ink);
   font-family: var(--font-sans);
+  /* Inter reads best very slightly tightened, with antialiasing + kerning. */
+  letter-spacing: -0.011em;
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
 }
+
+/* Headings/labels: a touch tighter still for that designed, professional feel. */
+h1, h2, h3, h4 { letter-spacing: -0.02em; }
 
 #root {
   display: flex;

@@ -1,14 +1,21 @@
-export default function AppHeader({ context = [], phase, phaseColor = "green", children }) {
+export default function AppHeader({ context = [], phase, phaseColor = "green", brand = true, children }) {
   const dotCls = phaseColor === "blue" ? "bg-brand" : "bg-ok"
 
   return (
     <header className="h-12 px-5 flex items-center justify-between border-b border-hair bg-white shrink-0">
       <div className="flex items-center gap-1.5 text-[15px]">
-        <span className="text-brand font-medium tracking-wide">SteadyPT</span>
+        {brand && (
+          <span className="flex items-center gap-2 mr-0.5">
+            <img src="/logo-mark.png" alt="" aria-hidden="true" className="h-[22px] w-auto" />
+            <span className="font-semibold tracking-tight text-ink text-[15px]">
+              Steady<span className="text-brand">PT</span>
+            </span>
+          </span>
+        )}
         {context.map((s, i) => (
           <span key={i} className="flex items-center gap-1.5">
-            <span className="text-ink-faint">·</span>
-            <span className="text-ink-soft text-xs">{s}</span>
+            {(brand || i > 0) && <span className="text-ink-faint">·</span>}
+            <span className={i === 0 && !brand ? "text-ink font-medium text-sm" : "text-ink-soft text-xs"}>{s}</span>
           </span>
         ))}
       </div>

@@ -4,7 +4,6 @@ import GhostButton from "../components/GhostButton"
 import PrimaryButton from "../components/PrimaryButton"
 import MetricTile from "../components/MetricTile"
 import Pill from "../components/Pill"
-import { useDebriefAudio } from "../coach/useDebriefAudio"
 import { useSession } from "../SocketContext"
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -26,16 +25,10 @@ function friendlyFatigue(f) {
   return m ? `Smoothness dropped ${m[1]}%` : String(f).replace(/_/g, " ")
 }
 
-function pct1(ratio) {
-  if (ratio == null) return null
-  return Math.round(ratio * 100)
-}
-
 // ── Main Debrief screen ──────────────────────────────────────────────
 export default function Debrief({ setScreen }) {
   const { summary, aiDebrief, send, setSummary } = useSession()
   const [showClinical, setShowClinical] = useState(false)
-  const { audioState, play, stop } = useDebriefAudio()
   const clinicalRef = useRef(null)
 
   // Animate clinical section open
@@ -97,7 +90,6 @@ export default function Debrief({ setScreen }) {
   const aDepth = analysis.depth || {}
   const aTempo = analysis.tempo || {}
   const aForm = analysis.form || {}
-  const aTracking = analysis.tracking || {}
 
   // For the bar chart, "best" depends on direction.
   const avgDepth = aDepth.mean_deg != null ? Math.round(aDepth.mean_deg) : avg(depths)
@@ -136,9 +128,6 @@ export default function Debrief({ setScreen }) {
     aiDebrief?.text || summary.ai_debrief || summary.templated_debrief || ""
 
   const score = summary.score || {}
-
-  const cameraPct = pct1(aTracking.camera_frame_ratio)
-  const imuPct = pct1(aTracking.imu_frame_ratio)
 
   const formNotes = Array.isArray(aForm.notes) ? aForm.notes : []
   const flagCounts = aForm.flag_counts || {}
@@ -306,58 +295,37 @@ export default function Debrief({ setScreen }) {
     </div>
   )
 
-  // ── Source bar ────────────────────────────────────────
-  const renderSourceBar = () => {
-    if (cameraPct == null && imuPct == null) return null
-    const cam = cameraPct ?? 100 - (imuPct ?? 0)
-    const imu = imuPct ?? 100 - cam
-    return (
-      <div className="flex flex-col gap-2">
-        <h4 className="text-xs font-medium text-ink-faint uppercase tracking-wide">
-          Tracking source
-        </h4>
-        <div className="flex h-4 rounded-full overflow-hidden">
-          <div className="bg-brand" style={{ width: `${cam}%` }} />
-          <div className="bg-warn" style={{ width: `${imu}%` }} />
-        </div>
-        <div className="flex justify-between text-[10px] text-ink-faint">
-          <span>Camera {cam}%</span>
-          <span>IMU {imu}%</span>
-        </div>
-      </div>
-    )
-  }
-
   const headline = score.headline || "Nice work."
+  const overall = score.overall
+  const scoreColor =
+    overall == null ? "text-ink"
+      : overall >= 80 ? "text-ok"
+        : overall >= 60 ? "text-brand"
+          : "text-warn"
 
   return (
     <div className="flex flex-col gap-4">
       {/* ── Coach card ─────────────────────────────────────── */}
       <Card soft>
-        <div className="flex items-start gap-3">
-          <div className="w-10 h-10 rounded-full bg-brand-bg text-brand flex items-center justify-center shrink-0">
-            <i className="ti ti-activity text-lg" />
+        <div className="flex items-start gap-5">
+          {/* Set score — the headline number, sized to lead the card */}
+          <div className="flex flex-col items-center shrink-0 w-20">
+            <span className={`text-6xl font-semibold tabular-nums leading-none ${scoreColor}`}>
+              {overall ?? "—"}
+            </span>
+            <span className="text-[11px] text-ink-faint mt-2 uppercase tracking-wide">
+              {score.grade || "Set score"}
+            </span>
           </div>
-          <div className="flex flex-col gap-2 flex-1">
+          <div className="flex flex-col gap-2 flex-1 min-w-0">
             <h2 className="text-base font-semibold text-ink">{headline}</h2>
             <p className="text-sm text-ink-soft leading-relaxed">{coachText}</p>
-            <div className="flex items-center gap-3">
-              <GhostButton
-                onClick={() =>
-                  audioState === "playing" ? stop() : play(coachText)
-                }
-                disabled={!coachText}
-              >
-                <i
-                  className={`ti ti-${audioState === "playing" ? "player-pause" : "volume"} text-base`}
-                />
-                {audioState === "loading"
-                  ? "Loading…"
-                  : audioState === "playing"
-                    ? "Pause"
-                    : "Play debrief"}
-              </GhostButton>
-            </div>
+            {aiDebrief?.text && (
+              <p className="flex items-center gap-1.5 text-[11px] text-ink-faint">
+                <i className="ti ti-sparkles text-xs" />
+                Coached by Gemini 2.5 Flash
+              </p>
+            )}
           </div>
         </div>
       </Card>
@@ -453,10 +421,6 @@ export default function Debrief({ setScreen }) {
               Metrics
             </h4>
             {renderClinicalMetrics()}
-          </Card>
-
-          <Card>
-            {renderSourceBar()}
           </Card>
 
           <Card>

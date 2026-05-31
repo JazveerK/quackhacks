@@ -11,10 +11,10 @@
  * `reps` is the new rep count (just incremented), `target` the set goal,
  * `formFlag` an optional backend form flag for this rep (e.g. "shallow").
  */
-const MOTIVATION = ['Nice and controlled.', 'Good rep.', 'Strong.', 'Smooth.']
-
 export function cueForRep({ reps, target, formFlag }) {
   // Form correction takes priority — it's the only thing worth interrupting for.
+  // The caller (VoiceAssistant) rate-limits these so the same correction can't
+  // repeat every rep; here we just classify the flag into a short line.
   if (formFlag) {
     const f = String(formFlag).toLowerCase()
     if (f.includes('shallow') || f.includes('depth')) return 'A little deeper.'
@@ -25,16 +25,14 @@ export function cueForRep({ reps, target, formFlag }) {
   if (!target || target <= 0) return null
   const left = target - reps
 
-  // Final countdown.
-  if (left === 3) return 'Three to go.'
+  // Final two reps only — keep the set quiet otherwise.
   if (left === 2) return 'Two more.'
   if (left === 1) return 'Last one.'
   if (left <= 0) return null // set completion is handled by the debrief flow
 
   // Halfway marker (only for sets long enough to have a meaningful midpoint).
-  if (target >= 6 && reps === Math.ceil(target / 2)) return 'Halfway — keep it steady.'
+  if (target >= 8 && reps === Math.ceil(target / 2)) return 'Halfway — keep it steady.'
 
-  // Otherwise stay quiet most of the time; an occasional light nudge.
-  if (reps > 0 && reps % 3 === 0) return MOTIVATION[(reps / 3) % MOTIVATION.length | 0]
+  // Everything else passes in silence. No per-rep motivational chatter.
   return null
 }

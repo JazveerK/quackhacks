@@ -31,7 +31,7 @@ const DEMO_OBSERVATION = {
     { text: "SCREENING SIGNAL: Score is below the CDC STEADI fall-risk threshold for this age/sex cohort. This is a screening signal for clinician review, not a clinical conclusion." },
   ],
   component: [
-    { code: { coding: [{ system: "urn:physiofusion:metrics", code: "tracking-source", display: "Tracking source" }], text: "Tracking source" }, valueString: "fused" },
+    { code: { coding: [{ system: "urn:physiofusion:metrics", code: "tracking-source", display: "Tracking source" }], text: "Tracking source" }, valueString: "camera" },
     { code: { coding: [{ system: "urn:physiofusion:metrics", code: "tracking-confidence", display: "Tracking confidence (mean)" }], text: "Tracking confidence (mean)" }, valueQuantity: { value: 0.92 } },
     { code: { coding: [{ system: "urn:physiofusion:metrics", code: "quality-gate", display: "Quality gate result" }], text: "Quality gate result" }, valueString: "pass" },
     { code: { coding: [{ system: "urn:physiofusion:metrics", code: "calibration-id", display: "Calibration ID" }], text: "Calibration ID" }, valueString: "cal-demo-001" },

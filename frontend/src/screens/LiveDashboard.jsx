@@ -1,13 +1,11 @@
-import { useRef, useState } from "react"
+import { useRef } from "react"
 import { useSession } from "../SocketContext"
 import AppHeader from "../components/AppHeader"
 import GhostButton from "../components/GhostButton"
 import CameraPanel from "../components/CameraPanel"
 import RepCounter from "../components/RepCounter"
-import TrackingSource from "../components/TrackingSource"
 import FormCueBanner from "../components/FormCueBanner"
 import Pill from "../components/Pill"
-import SetupPoseGuide from "./SetupPoseGuide"
 
 const CUES = [
   "Good depth — control the way up",
@@ -19,7 +17,6 @@ const CUES = [
 
 export default function LiveDashboard({ setScreen, workout = [], workoutPos = { ex: 0, set: 1 }, setWorkoutPos }) {
   const { connected, state, frame, send } = useSession()
-  const [setupDone, setSetupDone] = useState(false)
   const lastRepRef = useRef(0)
   const cueIndexRef = useRef(0)
 
@@ -53,22 +50,6 @@ export default function LiveDashboard({ setScreen, workout = [], workoutPos = { 
 
   const angle = state.angle ?? 180
   const target = state.target_depth_deg ?? 95
-
-  // Show the setup pose guide once before the active set begins.
-  if (!setupDone && phase === "SET_ACTIVE" && repCount === 0) {
-    return (
-      <div className="flex flex-col h-full p-4">
-        <SetupPoseGuide
-          personalTargetDepthDeg={target}
-          onConfirmed={() => setSetupDone(true)}
-          onSkip={() => setSetupDone(true)}
-          backendLandmarks={state.pose_landmarks ?? null}
-          backendFrame={frame ?? null}
-        />
-      </div>
-    )
-  }
-
   const tempo = state.tempo ?? 0
 
   const exerciseUi = state.exercise_ui ?? {}
@@ -130,20 +111,32 @@ export default function LiveDashboard({ setScreen, workout = [], workoutPos = { 
   const phaseLabel = PHASE_LABEL[phase] ?? "Live"
   const phaseColor = isActive ? "green" : "blue"
 
-  // Depth status — icon + text + color
+  // Gauge metadata is exercise-driven. `rom_metric` tells us which direction
+  // counts as progress: "min" = deeper/lower angle is better (squat), "max" =
+  // higher angle is better (lateral raise). Everything below is direction-aware.
+  const romMetric = exerciseUi.rom_metric ?? "min"
+  const higherIsBetter = romMetric === "max"
+  const gaugeLabel = exerciseUi.depth_label ?? "Depth"
+  const gaugeMin = exerciseUi.gauge_min_deg ?? 60
+  const gaugeMax = exerciseUi.gauge_max_deg ?? 180
+
+  // Signed distance from target, positive = needs to move further toward target.
+  const shortfall = higherIsBetter ? target - angle : angle - target
+
+  // Status — icon + text + color, framed by the exercise's target direction.
   let depthLabel, depthVariant, depthIcon
-  if (angle <= target + 5) {
+  if (shortfall <= 5) {
     depthLabel = "At target"
     depthVariant = "ok"
     depthIcon = "ti-check"
-  } else if (angle <= target + 20) {
-    depthLabel = "Approaching"
+  } else if (shortfall <= 20) {
+    depthLabel = "Almost there"
     depthVariant = "brand"
-    depthIcon = "ti-arrow-down"
+    depthIcon = higherIsBetter ? "ti-arrow-up" : "ti-arrow-down"
   } else {
-    depthLabel = "Above target"
+    depthLabel = higherIsBetter ? "Raise higher" : "Go deeper"
     depthVariant = "warn"
-    depthIcon = "ti-arrow-up"
+    depthIcon = higherIsBetter ? "ti-arrow-up" : "ti-arrow-down"
   }
 
   // Tempo assessment
@@ -159,7 +152,12 @@ export default function LiveDashboard({ setScreen, workout = [], workoutPos = { 
     <div className="flex flex-col h-full">
       {/* Header — workout controls */}
       <AppHeader
-        context={[exerciseName, `${repCount} / ${state.rep_target ?? "—"} reps`]}
+        brand={false}
+        context={[
+          exerciseName,
+          hasWorkout && `Set ${setNum}/${curEx.sets}`,
+          `${repCount} / ${state.rep_target ?? "—"} reps`,
+        ].filter(Boolean)}
         phase={phaseLabel}
         phaseColor={phaseColor}
       >
@@ -183,8 +181,9 @@ export default function LiveDashboard({ setScreen, workout = [], workoutPos = { 
         ) : null}
       </AppHeader>
 
-      {/* Workout plan progress */}
-      {hasWorkout && (
+      {/* Workout plan progress — only when the plan has more than one exercise;
+          a single-exercise plan is already covered by the header above. */}
+      {hasWorkout && workout.length > 1 && (
         <div className="shrink-0 flex items-center gap-2 px-4 py-2 border-b border-hair bg-surface overflow-x-auto">
           {workout.map((ex, i) => {
             const current = i === exIdx
@@ -221,6 +220,19 @@ export default function LiveDashboard({ setScreen, workout = [], workoutPos = { 
           {phase === "SET_ACTIVE" && state.setup_status?.severity === "blocking" && (
             <CameraLostOverlay setup={state.setup_status} />
           )}
+          {/* Framing warning — large banner across the top of the camera. It
+              degrades tracking, so it has to be impossible to miss and clear of
+              the mic button in the bottom-right. */}
+          {phase === "SET_ACTIVE" && state.setup_status?.severity === "warning" && (
+            <div className="absolute inset-x-0 top-0 p-3 z-30">
+              <div className="mx-auto flex max-w-[92%] items-center gap-3 rounded-2xl bg-warn-bg/95 px-5 py-4 shadow-lg ring-1 ring-warn/25 backdrop-blur-sm">
+                <i className="ti ti-alert-triangle shrink-0 text-2xl text-warn" />
+                <span className="text-[17px] font-semibold leading-snug text-warn">
+                  {state.setup_status.hint}
+                </span>
+              </div>
+            </div>
+          )}
           {phase === "COUNTDOWN" && (
             <div className="absolute inset-0 flex items-center justify-center bg-ink/40 rounded-lg">
               <span className="text-white text-7xl font-medium tabular-nums leading-none">
@@ -239,14 +251,21 @@ export default function LiveDashboard({ setScreen, workout = [], workoutPos = { 
           {/* Knee depth with arc gauge */}
           <div className="bg-white rounded-2xl p-4">
             <div className="flex items-center justify-between mb-3">
-              <div className="text-[12px] text-ink-faint font-medium uppercase tracking-wide">Knee depth</div>
+              <div className="text-[12px] text-ink-faint font-medium uppercase tracking-wide">{gaugeLabel}</div>
               <Pill variant={depthVariant}>
                 <i className={`ti ${depthIcon} text-[11px]`} />
                 {depthLabel}
               </Pill>
             </div>
             <div className="flex items-center gap-4">
-              <DepthArc angle={angle} target={target} depthVariant={depthVariant} />
+              <DepthArc
+                angle={angle}
+                target={target}
+                gaugeMin={gaugeMin}
+                gaugeMax={gaugeMax}
+                higherIsBetter={higherIsBetter}
+                depthVariant={depthVariant}
+              />
               <div>
                 <span
                   className="text-[32px] font-semibold text-ink tabular-nums leading-none tracking-tight"
@@ -274,16 +293,10 @@ export default function LiveDashboard({ setScreen, workout = [], workoutPos = { 
             </span>
           </div>
 
-          {/* Tracking source — shows camera/IMU signal bars */}
-          <TrackingSource state={state} profile={state?.profile} />
-
-          {/* Setup hint */}
-          {state.setup_status && state.setup_status.severity !== "good" && (
-            <div className={`rounded-2xl p-4 text-[13px] font-medium flex items-center gap-2.5 ${
-              state.setup_status.severity === "blocking" || state.setup_status.severity === "warning"
-                ? "bg-warn-bg text-warn"
-                : "bg-surface text-ink-faint"
-            }`}>
+          {/* Minor setup notes only — warning/blocking are surfaced as large
+              overlays on the camera above, so keep this for low-key info. */}
+          {state.setup_status && state.setup_status.severity === "info" && (
+            <div className="rounded-2xl p-4 text-[13px] font-medium flex items-center gap-2.5 bg-surface text-ink-faint">
               <i className="ti ti-info-circle text-[16px] shrink-0" />
               {state.setup_status.hint}
             </div>
@@ -372,40 +385,57 @@ function CameraLostOverlay({ setup }) {
   )
 }
 
-/* ── Half-circle arc gauge ── */
-function DepthArc({ angle, target, depthVariant }) {
-  const A_MIN = 60
-  const A_MAX = 180
-  const pct = Math.max(0, Math.min(1, (A_MAX - angle) / (A_MAX - A_MIN)))
-  const targetPct = Math.max(0, Math.min(1, (A_MAX - target) / (A_MAX - A_MIN)))
+/* ── Half-circle arc gauge ──
+ * Fill always grows toward the target: for a squat (rom_metric "min") the arc
+ * fills as the knee angle drops; for a lateral raise ("max") it fills as the
+ * shoulder angle climbs. The fill fraction is clamped to [0,1] so the green
+ * bar can never spill past the track, and animates smoothly via stroke-dash. */
+function DepthArc({ angle, target, gaugeMin, gaugeMax, higherIsBetter, depthVariant }) {
+  const span = Math.max(1, gaugeMax - gaugeMin)
+  // Progress toward target as a fraction of the gauge span.
+  const raw = higherIsBetter
+    ? (angle - gaugeMin) / span
+    : (gaugeMax - angle) / span
+  const pct = Math.max(0, Math.min(1, raw))
+  const targetRaw = higherIsBetter
+    ? (target - gaugeMin) / span
+    : (gaugeMax - target) / span
+  const targetPct = Math.max(0, Math.min(1, targetRaw))
 
   const R = 36, CX = 44, CY = 44
+  const SEMI = Math.PI * R // arc length of the half circle
 
   function pt(frac) {
     const a = Math.PI - frac * Math.PI
     return [CX + R * Math.cos(a), CY - R * Math.sin(a)]
   }
 
-  function arc(from, to) {
-    const [x1, y1] = pt(from)
-    const [x2, y2] = pt(to)
-    return `M ${x1} ${y1} A ${R} ${R} 0 ${to - from > 0.5 ? 1 : 0} 1 ${x2} ${y2}`
-  }
-
+  const trackPath = `M ${CX - R} ${CY} A ${R} ${R} 0 0 1 ${CX + R} ${CY}`
   const [tx, ty] = pt(targetPct)
   const fillColor = depthVariant === "ok"
     ? "var(--color-ok)"
     : depthVariant === "warn"
       ? "var(--color-warn)"
-      : "var(--color-ink-faint)"
+      : "var(--color-brand)"
 
   return (
     <svg viewBox="0 0 88 50" className="w-20 shrink-0" role="img" aria-hidden="true">
-      <path d={arc(0, 1)} fill="none" stroke="var(--color-surface)" strokeWidth="7" strokeLinecap="round" />
-      {pct > 0.01 && (
-        <path d={arc(0, pct)} fill="none" stroke={fillColor} strokeWidth="7" strokeLinecap="round" />
-      )}
-      <circle cx={tx} cy={ty} r="4" fill="var(--color-ok)" stroke="white" strokeWidth="2" />
+      {/* Track — flat (butt) caps so the semicircle ends flush at the baseline
+          instead of sprouting round nubs that hang below it. */}
+      <path d={trackPath} fill="none" stroke="var(--color-surface)" strokeWidth="7" strokeLinecap="butt" />
+      {/* Fill — same path, revealed left→right via dash offset so it can't overflow */}
+      <path
+        d={trackPath}
+        fill="none"
+        stroke={fillColor}
+        strokeWidth="7"
+        strokeLinecap="butt"
+        strokeDasharray={SEMI}
+        strokeDashoffset={SEMI * (1 - pct)}
+        style={{ transition: "stroke-dashoffset 0.35s ease-out, stroke 0.2s linear" }}
+      />
+      {/* Target marker */}
+      <circle cx={tx} cy={ty} r="3.5" fill="white" stroke="var(--color-ok)" strokeWidth="2.5" />
     </svg>
   )
 }

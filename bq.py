@@ -87,6 +87,15 @@ def _fatigue_score(summary: dict) -> float:
     }.get(sig, 0.0)
 
 
+def _adherence_bool(flag) -> bool:
+    """The `sessions.adherence_flag` column is BOOLEAN. Callers historically pass
+    a string like 'complete'/'partial' (or a real bool); coerce to a proper bool
+    so the streaming insert doesn't fail the type check and silently drop the row."""
+    if isinstance(flag, bool):
+        return flag
+    return str(flag).strip().lower() in ("complete", "true", "1", "yes", "done")
+
+
 def _next_recommendation(summary: dict) -> str:
     """One-line "what to change next set" derived from the analysis.
 
@@ -134,6 +143,8 @@ def insert_set(session_id: str, set_index: int, summary: dict) -> bool:
         "fatigue_score": _fatigue_score(summary),
         "debrief_text": debrief_text[:1024],
         "recommended_next": _next_recommendation(summary)[:256],
+        # created_at lets the PT trend view order sets chronologically.
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
     try:
         client = init_client()
@@ -173,10 +184,12 @@ def insert_session(
         "user_id": user_id,
         "exercise": "bodyweight_squat",
         "started_at": started_at.isoformat(),
+        "ended_at": datetime.now(timezone.utc).isoformat(),
         "sets_count": int(sets_count),
         "total_reps": int(total_reps),
         "avg_depth": float(round(avg_depth, 2)),
-        "adherence_flag": adherence_flag[:64],
+        # BOOLEAN column — coerce 'complete'/'partial' strings to a real bool.
+        "adherence_flag": _adherence_bool(adherence_flag),
     }
     if sts_observation is not None:
         import json as _json
@@ -262,11 +275,56 @@ def query_recent_sets(limit: int = 50) -> list[dict]:
         client = init_client()
         rows = client.query(
             f"SELECT session_id, set_index, reps, avg_depth_deg, min_depth_deg, "
-            f"fatigue_score, debrief_text, recommended_next "
-            f"FROM `{table}` ORDER BY session_id DESC, set_index DESC "
+            f"fatigue_score, debrief_text, recommended_next, created_at "
+            # created_at gives true chronological order; NULLs (legacy rows with
+            # no timestamp) sort last in DESC. session_id/set_index break ties.
+            f"FROM `{table}` ORDER BY created_at DESC, session_id DESC, set_index DESC "
             f"LIMIT {int(limit)}"
         ).result()
-        return [dict(r) for r in rows]
+        out = []
+        for r in rows:
+            d = dict(r)
+            ca = d.get("created_at")
+            if ca is not None and hasattr(ca, "isoformat"):
+                d["created_at"] = ca.isoformat()
+            out.append(d)
+        return out
     except Exception as e:
         print(f"[bq] query_recent_sets exception: {e.__class__.__name__}: {e}")
+        return []
+
+
+def query_session_history(user_id: str, limit: int = 60) -> list[dict]:
+    """Per-session history for one user, OLDEST FIRST. Powers the cross-session
+    ROM/adherence trend and feeds the Gemini progress report. [] on failure."""
+    table = _sessions_table()
+    if table is None:
+        return []
+    try:
+        from google.cloud import bigquery
+        client = init_client()
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("uid", "STRING", user_id),
+                bigquery.ScalarQueryParameter("lim", "INT64", int(limit)),
+            ]
+        )
+        rows = client.query(
+            f"SELECT session_id, user_id, exercise, started_at, ended_at, "
+            f"sets_count, total_reps, avg_depth, adherence_flag "
+            f"FROM `{table}` WHERE user_id = @uid "
+            f"ORDER BY started_at LIMIT @lim",
+            job_config=job_config,
+        ).result()
+        out = []
+        for r in rows:
+            d = dict(r)
+            for k in ("started_at", "ended_at"):
+                v = d.get(k)
+                if v is not None and hasattr(v, "isoformat"):
+                    d[k] = v.isoformat()
+            out.append(d)
+        return out
+    except Exception as e:
+        print(f"[bq] query_session_history exception: {e.__class__.__name__}: {e}")
         return []
