@@ -16,7 +16,7 @@ const CUES = [
   "Steady through the bottom",
 ]
 
-export default function LiveDashboard({ setScreen }) {
+export default function LiveDashboard({ setScreen, workout = [], workoutPos = { ex: 0, set: 1 }, setWorkoutPos }) {
   const { connected, state, frame, send } = useSession()
   const lastRepRef = useRef(0)
   const cueIndexRef = useRef(0)
@@ -55,6 +55,50 @@ export default function LiveDashboard({ setScreen }) {
   const isActive = phase === "SET_ACTIVE"
   const canStart = phase === "WAITING_FOR_START" || phase === "DEBRIEF"
 
+  // ── Workout plan progression ──────────────────────────────────────
+  // The plan built on check-in drives which exercise + set comes next. When a
+  // set finishes (SET_END / DEBRIEF) we offer the next step instead of a bare
+  // "start set", reconfiguring the tracker (exercise + rep target) as we go.
+  const hasWorkout = Array.isArray(workout) && workout.length > 0
+  const exIdx = Math.min(workoutPos.ex ?? 0, Math.max(0, workout.length - 1))
+  const curEx = hasWorkout ? workout[exIdx] : null
+  const setNum = workoutPos.set ?? 1
+  const isLastSet = curEx ? setNum >= curEx.sets : true
+  const isLastExercise = exIdx >= workout.length - 1
+  const setDone = phase === "DEBRIEF" || (hasWorkout && phase === "SET_END")
+  const workoutDone = hasWorkout && setDone && isLastSet && isLastExercise
+
+  const advanceWorkout = () => {
+    if (!hasWorkout) {
+      send({ cmd: "start_set" })
+      return
+    }
+    if (!isLastSet) {
+      // Same exercise, next set.
+      setWorkoutPos({ ex: exIdx, set: setNum + 1 })
+      send({ cmd: "reset_set", rep_target: curEx.reps })
+      send({ cmd: "start_set" })
+    } else if (!isLastExercise) {
+      // Move on to the next exercise's first set.
+      const next = workout[exIdx + 1]
+      setWorkoutPos({ ex: exIdx + 1, set: 1 })
+      send({ cmd: "select_exercise", id: next.id })
+      send({ cmd: "reset_set", rep_target: next.reps })
+      send({ cmd: "start_set" })
+    } else {
+      // Whole plan finished — head to the debrief.
+      setScreen("debrief")
+    }
+  }
+
+  const nextLabel = !hasWorkout
+    ? "Start set"
+    : !isLastSet
+      ? `Start set ${setNum + 1}`
+      : !isLastExercise
+        ? `Next: ${workout[exIdx + 1].name}`
+        : "Finish workout"
+
   const PHASE_LABEL = {
     WAITING_FOR_START: "Ready",
     COUNTDOWN: "Get ready",
@@ -91,19 +135,55 @@ export default function LiveDashboard({ setScreen }) {
             <i className="ti ti-player-stop text-sm" />
             End set
           </GhostButton>
+        ) : setDone ? (
+          <GhostButton onClick={advanceWorkout}>
+            <i className={`ti ${workoutDone ? "ti-flag-check" : "ti-player-play"} text-sm`} />
+            {nextLabel}
+          </GhostButton>
         ) : canStart ? (
           <GhostButton onClick={() => send({ cmd: "start_set" })}>
             <i className="ti ti-player-play text-sm" />
-            Start set
+            {phase === "WAITING_FOR_START" && state.start_pending
+              ? "Waiting for camera…"
+              : "Start set"}
           </GhostButton>
         ) : null}
       </AppHeader>
+
+      {/* Workout plan progress */}
+      {hasWorkout && (
+        <div className="shrink-0 flex items-center gap-2 px-4 py-2 border-b border-hair bg-surface overflow-x-auto">
+          {workout.map((ex, i) => {
+            const current = i === exIdx
+            const done = i < exIdx
+            return (
+              <div
+                key={i}
+                className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs whitespace-nowrap ${
+                  current
+                    ? "bg-brand text-white font-medium"
+                    : done
+                      ? "bg-ok-bg text-ok"
+                      : "bg-white text-ink-soft"
+                }`}
+              >
+                {done && <i className="ti ti-check text-xs" />}
+                <span>{ex.name}</span>
+                <span className={current ? "text-white/80" : "text-ink-faint"}>
+                  {current ? `set ${setNum}/${ex.sets}` : `${ex.sets}×${ex.reps}`}
+                </span>
+              </div>
+            )
+          })}
+        </div>
+      )}
 
       {/* 3-column grid */}
       <div className="flex-1 grid grid-cols-[3fr_1.25fr_0.75fr] gap-3 p-3 min-h-0">
         {/* Camera (60%) */}
         <div className="relative min-h-0">
           <CameraPanel frame={frame} />
+          {phase === "WAITING_FOR_START" && <CameraCheck state={state} />}
           {phase === "COUNTDOWN" && (
             <div className="absolute inset-0 flex items-center justify-center bg-ink/40 rounded-lg">
               <span className="text-white text-7xl font-medium tabular-nums leading-none">
@@ -171,6 +251,48 @@ export default function LiveDashboard({ setScreen }) {
           <span className="text-sm text-ink-soft">&ldquo;{cue}&rdquo;</span>
         </div>
       )}
+    </div>
+  )
+}
+
+/* ── Camera-angle check (shown before a set starts) ── */
+function CameraCheck({ state }) {
+  const setup = state.setup_status ?? {}
+  // Backend confirms the angle once framing + the per-exercise view check pass.
+  const ready = setup.code === "ok" || setup.code === "low_visibility"
+  const pending = !!state.start_pending
+  const positionHint = state.exercise_ui?.position_hint
+  const hint = setup.hint || positionHint || "Getting the camera ready…"
+
+  // Tone: green when good, red for hard blockers, amber for "adjust the angle".
+  const tone = ready ? "ok" : setup.severity === "blocking" ? "bad" : "warn"
+  const accent = { ok: "text-emerald-300", warn: "text-amber-300", bad: "text-red-300" }[tone]
+  const icon = ready
+    ? "ti-circle-check"
+    : tone === "bad"
+      ? "ti-alert-triangle"
+      : "ti-camera"
+
+  const title = ready
+    ? pending
+      ? "Camera looks good — starting…"
+      : "Camera looks good — say “start set”"
+    : pending
+      ? "Hold on — line up the camera"
+      : "Check your camera angle"
+
+  return (
+    <div className="absolute inset-x-0 bottom-0 p-3">
+      <div className="rounded-lg border border-white/10 bg-ink/70 backdrop-blur-sm px-4 py-3 flex items-start gap-3">
+        <i className={`ti ${icon} text-xl leading-none mt-0.5 ${accent}`} />
+        <div className="min-w-0">
+          <div className="text-sm font-medium text-white">{title}</div>
+          <div className="text-xs text-white/80 mt-0.5">{hint}</div>
+        </div>
+        {pending && !ready && (
+          <i className="ti ti-loader-2 text-white/60 text-lg ml-auto animate-spin" />
+        )}
+      </div>
     </div>
   )
 }

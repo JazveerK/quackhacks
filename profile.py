@@ -1,5 +1,5 @@
 """
-PhysioFusion — PT prescription profile.
+SteadyPT — PT prescription profile.
 
 The PT uploads a free-form prescription text; `ai_agent.parse_prescription`
 turns it into a `PTProfile`. The tracker holds the active profile and uses its

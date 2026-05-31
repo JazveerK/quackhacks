@@ -1,6 +1,6 @@
 import { useState } from "react"
 import AppHeader from "./components/AppHeader"
-import CoachChat from "./components/CoachChat"
+import VoiceAssistant from "./components/VoiceAssistant"
 import CheckIn from "./screens/CheckIn"
 import LiveDashboard from "./screens/LiveDashboard"
 import Debrief from "./screens/Debrief"
@@ -22,6 +22,11 @@ const phaseForScreen = {
 
 export default function App() {
   const [screen, setScreen] = useState("checkin")
+  // Today's workout plan, built on the check-in screen and driven through
+  // the live session: [{ id, name, sets, reps }]. `workoutPos` tracks where we
+  // are — which exercise (0-based) and which set (1-based).
+  const [workout, setWorkout] = useState([])
+  const [workoutPos, setWorkoutPos] = useState({ ex: 0, set: 1 })
   const { phase, color } = phaseForScreen[screen]
 
   return (
@@ -54,14 +59,28 @@ export default function App() {
 
       {/* Screen content */}
       <main className="flex-1 w-full max-w-5xl mx-auto px-4 pb-6">
-        {screen === "checkin"   && <CheckIn setScreen={setScreen} />}
-        {screen === "live"      && <LiveDashboard setScreen={setScreen} />}
+        {screen === "checkin"   && (
+          <CheckIn
+            setScreen={setScreen}
+            workout={workout}
+            setWorkout={setWorkout}
+            setWorkoutPos={setWorkoutPos}
+          />
+        )}
+        {screen === "live"      && (
+          <LiveDashboard
+            setScreen={setScreen}
+            workout={workout}
+            workoutPos={workoutPos}
+            setWorkoutPos={setWorkoutPos}
+          />
+        )}
         {screen === "debrief"   && <Debrief setScreen={setScreen} />}
         {screen === "clinician" && <ClinicianView setScreen={setScreen} />}
       </main>
 
-      {/* Floating coach chat — available on all screens */}
-      <CoachChat />
+      {/* Hands-free voice assistant — available on all screens */}
+      <VoiceAssistant setScreen={setScreen} />
     </div>
   )
 }

@@ -1,5 +1,5 @@
 """
-PhysioFusion — Exercise Spec generator (the ONLY LLM in the exercise pipeline).
+SteadyPT — Exercise Spec generator (the ONLY LLM in the exercise pipeline).
 
 `generate_spec_from_docs(documentation_text)` calls Gemini ONCE, at
 exercise-load time, to turn a PT's written exercise documentation into a
@@ -70,7 +70,10 @@ Rules for choosing values:
   target < trigger < start, and return is just below start. "max" => start small and the rep gets
   LARGER; order is start < trigger < target, and return is just above start.
 - Choose a "front" view for raises/abduction (motion is across the body) and "side" for
-  squats/curls/push-ups (motion is in profile).
+  squats/curls/push-ups (motion is in profile). The tracker enforces this at runtime with a
+  camera-angle check, so pick the view that actually shows the depth/range of the rep — a wrong
+  view makes the joint angle (and depth) read shallow. "side" is correct whenever the rep travels
+  toward/away from the floor in profile (the camera must be level with the body, not above it).
 - Keep cues to 2-4 words, imperative ("raise higher", "slow it down").
 
 WORKED EXAMPLES

@@ -1,5 +1,5 @@
 """
-PhysioFusion — Gemini Flash wrapper.
+SteadyPT — Gemini Flash wrapper.
 
 Two pure functions used by pose_tracker / server:
 
@@ -235,10 +235,15 @@ def generate_session_report(profile: PTProfile, set_rows: list[dict]) -> Optiona
 # ---------------------------------------------------------------------------
 # Conversational voice agent.
 # ---------------------------------------------------------------------------
-AGENT_ACTIONS = {"none", "start_set", "end_set", "next_set", "end_session"}
+AGENT_ACTIONS = {
+    "none", "start_set", "end_set", "next_set", "end_session",
+    # Navigation — lets the patient run the app entirely hands-free.
+    "go_checkin", "go_live", "go_debrief", "go_clinician",
+}
 
-_AGENT_PROMPT = """You are PhysioFusion's voice coach — a warm, encouraging physical-therapy
-exercise assistant talking OUT LOUD with a patient during their squat session.
+_AGENT_PROMPT = """You are SteadyPT's voice coach — a warm, encouraging physical-therapy
+exercise assistant talking OUT LOUD with a patient during their squat session. The patient
+controls the whole app by voice, hands-free, so you are also their navigator.
 You are NOT a doctor: never diagnose or prescribe medical treatment. If the patient
 mentions pain or a medical worry, respond with empathy and gently suggest they check
 with their physical therapist; do not give clinical advice.
@@ -248,10 +253,20 @@ You can take ACTIONS by setting the "action" field (infer intent, don't match ex
 - "end_set"     : they're done with the current set / "stop" / "that's enough".
 - "next_set"    : move on to the next set after a debrief.
 - "end_session" : finish the whole session / "I'm finished for today".
+- "go_checkin"  : show the check-in screen / "go to check in" / "home".
+- "go_live"     : show the live workout screen / "take me to the workout" / "live view".
+- "go_debrief"  : show the debrief / results screen / "show my results" / "how did the set go" (screen).
+- "go_clinician": show the clinician / PT screen / "open the clinician view" / "PT dashboard".
 - "none"        : just converse — answer a question, encourage, chat. No action.
 
 Only choose start_set when the phase is WAITING_FOR_START or DEBRIEF. Only choose end_set
 when phase is SET_ACTIVE. If an action doesn't fit the phase, use "none" and say why briefly.
+For navigation, prefer a go_* action when the patient clearly wants to see a different screen;
+if they're only asking a question (e.g. "how did I do"), answer it with "none" instead of navigating.
+
+KEEP IT MINIMAL DURING AN ACTIVE SET: when phase is SET_ACTIVE, the patient is mid-exercise —
+reply with at most a short word of encouragement (or nothing: empty speech) unless they clearly
+asked something or told you to stop. Don't chit-chat mid-rep.
 
 Use the CONTEXT (phase, prescription, reps, last set) to answer naturally and SPECIFICALLY
 — e.g. "how did I do" -> cite the last set's score and depth; "what's my prescription" ->

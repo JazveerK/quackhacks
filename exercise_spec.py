@@ -1,5 +1,5 @@
 """
-PhysioFusion — Exercise Spec schema (the "any exercise" contract).
+SteadyPT — Exercise Spec schema (the "any exercise" contract).
 
 An **Exercise Spec** is a structured, JSON-serialisable description of HOW to
 track and coach one exercise: which joint angle defines a rep, the angle
@@ -89,6 +89,13 @@ _VALID_METRICS = {"min", "max"}
 _VALID_VIEWS = {"front", "side"}
 _VALID_RULE_TYPES = {"tempo", "shallow", "target_not_reached", "rom"}
 
+# Default foreshortening floor applied to side-view exercises that don't pin
+# their own. Front-view exercises (raises / abduction) aren't depth-along-axis
+# sensitive, so they default to no check. Healthy side-view ratios run ~1.1
+# (arm vs torso) to ~1.6 (leg vs torso), so this leaves a wide safety margin and
+# only fires on a genuinely steep / top-down camera.
+_SIDE_VIEW_RATIO_DEFAULT = 0.55
+
 
 @dataclass
 class ExerciseSpec:
@@ -105,6 +112,14 @@ class ExerciseSpec:
     parallel_buffer_deg: float = 5.0      # band around target counted as "good"
     count_margin_deg: float = 10.0        # how far past parallel a rep must go to count
     use_imu_fusion: bool = False          # apply the IMU tilt fallback to this joint
+
+    # Camera-angle guard: the minimum projected driving-limb length / torso length
+    # the tracker tolerates while the limb is extended (at rest). A steep or
+    # top-down camera points along the axis the rep travels, foreshortening the
+    # limb in the image and making the joint angle — and therefore depth — read
+    # far shallower than it is. None => derive from `view`: side-view exercises
+    # (squat / push-up / curl) get the default floor; front-view ones get none.
+    min_limb_torso_ratio: Optional[float] = None
 
     # Identity + UI overrides (UI fields are otherwise derived in to_ui()).
     id: str = ""
@@ -188,6 +203,7 @@ class ExerciseSpec:
             parallel_buffer_deg=float(data.get("parallel_buffer_deg", 5.0)),
             count_margin_deg=float(data.get("count_margin_deg", 10.0)),
             use_imu_fusion=bool(data.get("use_imu_fusion", False)),
+            min_limb_torso_ratio=_opt_float(data.get("min_limb_torso_ratio")),
             id=str(data.get("id", "")),
             ui=dict(data.get("ui") or {}),
         )
@@ -201,6 +217,18 @@ class ExerciseSpec:
     @property
     def angle_noun(self) -> str:
         return self.ui.get("angle_noun") or self.primary_joint.name.replace("_", " ")
+
+    def view_check_ratio(self) -> float:
+        """Effective min driving-limb / torso ratio for the camera-angle check.
+
+        0.0 disables the check. An explicit `min_limb_torso_ratio` wins; otherwise
+        a side-view spec gets the module default and a front-view spec gets 0.0.
+        This is what gives documentation-generated exercises a camera-angle check
+        for free — they only have to declare `view`.
+        """
+        if self.min_limb_torso_ratio is not None:
+            return max(0.0, float(self.min_limb_torso_ratio))
+        return _SIDE_VIEW_RATIO_DEFAULT if self.view == "side" else 0.0
 
     def to_ui(self) -> dict:
         """The subset the frontend needs to label gauges + write copy. Derived
@@ -276,6 +304,8 @@ SQUAT_SPEC = ExerciseSpec(
     },
     rep_target=10,
     use_imu_fusion=True,
+    # Legs project ~1.6x torso side-on; flag below 0.80 (steep / top-down camera).
+    min_limb_torso_ratio=0.80,
     ui={
         "display_name": "Squat",
         "plural": "squats",
@@ -312,6 +342,10 @@ PUSHUP_SPEC = ExerciseSpec(
     },
     rep_target=10,
     count_margin_deg=12.0,
+    # The arm projects ~1.1x torso side-on; flag below 0.55. This is the exact
+    # case that fails when a push-up is filmed top-down from a table: the arm
+    # collapses along the camera axis and depth reads "shallow".
+    min_limb_torso_ratio=0.55,
     ui={
         "display_name": "Push-up",
         "plural": "push-ups",

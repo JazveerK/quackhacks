@@ -4,7 +4,7 @@ export default function AppHeader({ context = [], phase, phaseColor = "green", c
   return (
     <header className="h-12 px-5 flex items-center justify-between border-b border-hair bg-white shrink-0">
       <div className="flex items-center gap-1.5 text-[15px]">
-        <span className="text-brand font-medium tracking-wide">PhysioFusion</span>
+        <span className="text-brand font-medium tracking-wide">SteadyPT</span>
         {context.map((s, i) => (
           <span key={i} className="flex items-center gap-1.5">
             <span className="text-ink-faint">·</span>

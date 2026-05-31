@@ -1,5 +1,5 @@
 """
-PhysioFusion — BigQuery persistence (Google track #2).
+SteadyPT — BigQuery persistence (Google track #2).
 
 Writes per-set rows on set end and per-session rows on session end. Reads
 back for the PT progress view.

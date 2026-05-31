@@ -1,7 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react"
 import Card from "../components/Card"
 import Chip from "../components/Chip"
-import GhostButton from "../components/GhostButton"
 import PrimaryButton from "../components/PrimaryButton"
 import { useSession } from "../SocketContext"
 
@@ -15,30 +14,58 @@ const SR = typeof window !== "undefined"
 // ══════════════════════════════════════════════════════════════════════
 
 const PAIN_OPTIONS = ["None", "Mild", "Moderate", "Sharp"]
-const READY_OPTIONS = ["Yes, let's go", "Give me a minute"]
 
-function CheckInFlow({ setScreen, switchToIntake, micAvailable }) {
-  const { state, send } = useSession()
+// Small +/- number stepper used for sets and reps.
+function Stepper({ label, value, min, max, onChange }) {
+  const dec = () => onChange(Math.max(min, value - 1))
+  const inc = () => onChange(Math.min(max, value + 1))
+  return (
+    <div className="flex flex-col gap-1">
+      <span className="text-[10px] text-ink-faint tracking-wide">{label}</span>
+      <div className="flex items-center rounded-lg border border-hair bg-white">
+        <button
+          type="button"
+          onClick={dec}
+          className="w-8 h-9 flex items-center justify-center text-ink-soft hover:text-ink disabled:opacity-30"
+          disabled={value <= min}
+        >
+          <i className="ti ti-minus text-sm" />
+        </button>
+        <span className="w-8 text-center text-sm font-medium text-ink tabular-nums">
+          {value}
+        </span>
+        <button
+          type="button"
+          onClick={inc}
+          className="w-8 h-9 flex items-center justify-center text-ink-soft hover:text-ink disabled:opacity-30"
+          disabled={value >= max}
+        >
+          <i className="ti ti-plus text-sm" />
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function CheckInFlow({ setScreen, switchToIntake, micAvailable, workout, setWorkout, setWorkoutPos }) {
+  const { send } = useSession()
 
   const [kneeScore, setKneeScore] = useState(null)
   const [pain, setPain] = useState(null)
-  const [ready, setReady] = useState(null)
   const [listening, setListening] = useState(false)
   const recRef = useRef(null)
 
-  // ── Exercise selection ─────────────────────────────────────────────
+  // ── Exercise catalogue + workout builder ───────────────────────────
   const [exercises, setExercises] = useState([])
   const [exLoadError, setExLoadError] = useState(null)
+  const [pickId, setPickId] = useState("")
+  const [pickSets, setPickSets] = useState(3)
+  const [pickReps, setPickReps] = useState(10)
   const [docOpen, setDocOpen] = useState(false)
   const [docText, setDocText] = useState("")
   const [generating, setGenerating] = useState(false)
   const [genError, setGenError] = useState(null)
   const [genSuccess, setGenSuccess] = useState(null)
-
-  // Active exercise id comes from live session state once a frame arrives.
-  const activeId = state?.exercise ?? null
-  const activeExercise = exercises.find((e) => e.id === activeId) || null
-  const activeName = activeExercise?.display_name || activeId || null
 
   // Fetch the catalogue of exercises.
   const fetchExercises = useCallback(async () => {
@@ -49,6 +76,8 @@ function CheckInFlow({ setScreen, switchToIntake, micAvailable }) {
       const list = Array.isArray(data?.exercises) ? data.exercises : []
       setExercises(list)
       setExLoadError(null)
+      // Default the picker to the first option if nothing chosen yet.
+      setPickId((cur) => cur || list[0]?.id || "")
       return data
     } catch {
       setExLoadError("Couldn't load exercises. Check your connection.")
@@ -60,15 +89,19 @@ function CheckInFlow({ setScreen, switchToIntake, micAvailable }) {
     fetchExercises()
   }, [fetchExercises])
 
-  // Pick an exercise from the dropdown.
-  const handleSelect = useCallback(
-    (id) => {
-      if (!id) return
-      send({ cmd: "select_exercise", id })
-      setGenSuccess(null)
-      setGenError(null)
-    },
-    [send]
+  // Add the currently-picked exercise (with its sets/reps) to the workout.
+  const addExercise = useCallback(() => {
+    const ex = exercises.find((e) => e.id === pickId)
+    if (!ex) return
+    setWorkout((w) => [
+      ...w,
+      { id: ex.id, name: ex.display_name, sets: pickSets, reps: pickReps },
+    ])
+  }, [exercises, pickId, pickSets, pickReps, setWorkout])
+
+  const removeExercise = useCallback(
+    (idx) => setWorkout((w) => w.filter((_, i) => i !== idx)),
+    [setWorkout]
   )
 
   // Generate a new exercise spec from pasted documentation.
@@ -86,15 +119,14 @@ function CheckInFlow({ setScreen, switchToIntake, micAvailable }) {
       })
       const data = await res.json().catch(() => ({}))
       if (data?.source === "generated") {
-        // Re-fetch the catalogue, then select the newly loaded exercise.
+        // Re-fetch the catalogue, then pre-select the newly loaded exercise.
         const refreshed = await fetchExercises()
         const newId = data?.active ?? refreshed?.active ?? data?.spec?.id ?? null
-        if (newId) handleSelect(newId)
+        if (newId) setPickId(newId)
         const name = data?.spec?.display_name || newId || "exercise"
-        setGenSuccess(`Loaded "${name}" from your documentation.`)
+        setGenSuccess(`Loaded "${name}" — add it to your workout below.`)
         setGenError(null)
       } else {
-        // Fallback / default — surface the backend's explanation.
         setGenError(
           data?.error ||
             "Couldn't generate an exercise from that text. Try adding more detail."
@@ -105,10 +137,23 @@ function CheckInFlow({ setScreen, switchToIntake, micAvailable }) {
     } finally {
       setGenerating(false)
     }
-  }, [docText, generating, fetchExercises, handleSelect])
+  }, [docText, generating, fetchExercises])
+
+  // Begin the session: install the first exercise + its rep target, then go live.
+  const startSession = useCallback(() => {
+    if (!workout.length) return
+    const first = workout[0]
+    send({ cmd: "select_exercise", id: first.id })
+    send({ cmd: "reset_set", rep_target: first.reps })
+    send({ cmd: "start_set" })
+    setWorkoutPos({ ex: 0, set: 1 })
+    setScreen("live")
+  }, [workout, send, setWorkoutPos, setScreen])
+
+  const totalSets = workout.reduce((n, ex) => n + ex.sets, 0)
 
   // Which question is "active" (first unanswered)
-  const activeQ = kneeScore == null ? 1 : pain == null ? 2 : ready == null ? 3 : 3
+  const activeQ = kneeScore == null ? 1 : pain == null ? 2 : 3
 
   // ── Mic toggle ───────────────────────────────────────────────────
   const toggleMic = useCallback(() => {
@@ -136,18 +181,13 @@ function CheckInFlow({ setScreen, switchToIntake, micAvailable }) {
         const match = PAIN_OPTIONS.find((o) => t.includes(o.toLowerCase()))
         if (match) setPain(match)
       }
-      // Q3: ready
-      if (ready == null) {
-        if (t.includes("yes") || t.includes("let's go")) setReady(READY_OPTIONS[0])
-        else if (t.includes("minute") || t.includes("wait")) setReady(READY_OPTIONS[1])
-      }
       setListening(false)
     }
     rec.onerror = () => setListening(false)
     rec.onend = () => setListening(false)
     rec.start()
     setListening(true)
-  }, [listening, micAvailable, kneeScore, pain, ready])
+  }, [listening, micAvailable, kneeScore, pain])
 
   useEffect(() => {
     return () => recRef.current?.abort()
@@ -157,7 +197,7 @@ function CheckInFlow({ setScreen, switchToIntake, micAvailable }) {
     if (
       (n === 1 && kneeScore != null) ||
       (n === 2 && pain != null) ||
-      (n === 3 && ready != null)
+      (n === 3 && workout.length > 0)
     ) {
       return (
         <span className="w-6 h-6 rounded-full bg-ok-bg text-ok flex items-center justify-center text-xs">
@@ -177,8 +217,7 @@ function CheckInFlow({ setScreen, switchToIntake, micAvailable }) {
     )
   }
 
-  const cardBorder = (n) =>
-    n === activeQ ? "ring-1 ring-brand" : ""
+  const cardBorder = (n) => (n === activeQ ? "ring-1 ring-brand" : "")
 
   return (
     <div className="flex flex-col gap-4">
@@ -187,7 +226,8 @@ function CheckInFlow({ setScreen, switchToIntake, micAvailable }) {
         <div>
           <h2 className="text-lg font-semibold text-ink">Hi again.</h2>
           <p className="text-sm text-ink-soft mt-1 max-w-md">
-            Quick check before we start — tap an answer, or use the mic to speak.
+            Quick check, then build today's workout — tap an answer, or use the
+            mic to speak.
           </p>
         </div>
         <button
@@ -253,31 +293,16 @@ function CheckInFlow({ setScreen, switchToIntake, micAvailable }) {
         </div>
       </Card>
 
-      {/* Q3 — Ready */}
+      {/* Step 3 — Build the workout */}
       <Card className={cardBorder(3)}>
-        <div className="flex items-center gap-2 mb-3">
+        <div className="flex items-center gap-2 mb-1">
           {qBadge(3)}
-          <h3 className="text-sm font-medium text-ink">
-            Ready to start your session?
-          </h3>
+          <h3 className="text-sm font-medium text-ink">Set up your workout</h3>
         </div>
-        <div className="flex flex-wrap gap-2">
-          {READY_OPTIONS.map((opt) => (
-            <Chip key={opt} selected={ready === opt} onClick={() => setReady(opt)}>
-              {opt}
-            </Chip>
-          ))}
-        </div>
-      </Card>
-
-      {/* Exercise selection */}
-      <Card>
-        <div className="flex items-center gap-2 mb-3">
-          <i className="ti ti-stretching text-brand text-lg" />
-          <h3 className="text-sm font-medium text-ink">
-            Which exercise are we doing?
-          </h3>
-        </div>
+        <p className="text-xs text-ink-soft mb-3 ml-8">
+          Pick an exercise, choose sets and reps, then add it. Stack as many as
+          you like.
+        </p>
 
         {exLoadError && (
           <div className="flex items-start gap-2 rounded-lg bg-surface p-3 mb-3">
@@ -286,20 +311,39 @@ function CheckInFlow({ setScreen, switchToIntake, micAvailable }) {
           </div>
         )}
 
-        <select
-          value={activeId || ""}
-          onChange={(e) => handleSelect(e.target.value)}
-          className="w-full px-3 py-2 rounded-lg border border-hair bg-white text-sm text-ink focus:outline-none focus:ring-1 focus:ring-brand"
-        >
-          <option value="" disabled>
-            {exercises.length ? "Choose an exercise…" : "No exercises available"}
-          </option>
-          {exercises.map((ex) => (
-            <option key={ex.id} value={ex.id}>
-              {ex.display_name}
-            </option>
-          ))}
-        </select>
+        {/* Picker row */}
+        <div className="flex flex-wrap items-end gap-3">
+          <div className="flex flex-col gap-1 flex-1 min-w-[180px]">
+            <span className="text-[10px] text-ink-faint tracking-wide">
+              Exercise
+            </span>
+            <select
+              value={pickId}
+              onChange={(e) => setPickId(e.target.value)}
+              className="w-full h-9 px-3 rounded-lg border border-hair bg-white text-sm text-ink focus:outline-none focus:ring-1 focus:ring-brand"
+            >
+              <option value="" disabled>
+                {exercises.length ? "Choose an exercise…" : "No exercises available"}
+              </option>
+              {exercises.map((ex) => (
+                <option key={ex.id} value={ex.id}>
+                  {ex.display_name}
+                </option>
+              ))}
+            </select>
+          </div>
+          <Stepper label="Sets" value={pickSets} min={1} max={20} onChange={setPickSets} />
+          <Stepper label="Reps" value={pickReps} min={1} max={50} onChange={setPickReps} />
+          <button
+            type="button"
+            onClick={addExercise}
+            disabled={!pickId}
+            className="h-9 px-4 rounded-lg bg-brand text-white text-sm font-medium flex items-center gap-1.5 hover:opacity-90 disabled:opacity-40"
+          >
+            <i className="ti ti-plus text-sm" />
+            Add
+          </button>
+        </div>
 
         {/* Collapsible: generate from documentation */}
         <button
@@ -353,6 +397,42 @@ function CheckInFlow({ setScreen, switchToIntake, micAvailable }) {
             </div>
           </div>
         )}
+
+        {/* Workout list */}
+        <div className="mt-4 border-t border-hair pt-4">
+          {workout.length === 0 ? (
+            <p className="text-xs text-ink-faint text-center py-2">
+              No exercises yet — add one above to build your workout.
+            </p>
+          ) : (
+            <ul className="flex flex-col gap-2">
+              {workout.map((ex, i) => (
+                <li
+                  key={i}
+                  className="flex items-center gap-3 rounded-lg bg-surface px-3 py-2"
+                >
+                  <span className="w-6 h-6 rounded-full bg-white text-ink-soft flex items-center justify-center text-xs font-medium shrink-0">
+                    {i + 1}
+                  </span>
+                  <span className="text-sm font-medium text-ink flex-1 truncate">
+                    {ex.name}
+                  </span>
+                  <span className="text-xs text-ink-soft tabular-nums">
+                    {ex.sets} × {ex.reps}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => removeExercise(i)}
+                    className="text-ink-faint hover:text-bad transition-colors"
+                    title="Remove"
+                  >
+                    <i className="ti ti-x text-sm" />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
       </Card>
 
       {/* Footer */}
@@ -365,23 +445,20 @@ function CheckInFlow({ setScreen, switchToIntake, micAvailable }) {
           First time? Set up profile
         </button>
         <div className="flex items-center gap-3">
-          {activeName ? (
-            <span className="text-xs text-ink-soft">
-              Loaded:{" "}
-              <span className="font-medium text-ink">{activeName}</span>
+          {workout.length > 0 ? (
+            <span className="text-xs text-ink-soft tabular-nums">
+              {workout.length} exercise{workout.length > 1 ? "s" : ""} ·{" "}
+              {totalSets} set{totalSets > 1 ? "s" : ""}
             </span>
           ) : (
-            <span className="text-xs text-ink-faint">No exercise selected</span>
+            <span className="text-xs text-ink-faint">No exercises added</span>
           )}
           <PrimaryButton
-            onClick={() => {
-              send({ cmd: "start_set" })
-              setScreen("live")
-            }}
+            onClick={startSession}
             arrow
-            className={!activeId ? "opacity-50 pointer-events-none" : ""}
+            className={!workout.length ? "opacity-50 pointer-events-none" : ""}
           >
-            Start session
+            Start workout
           </PrimaryButton>
         </div>
       </div>
@@ -425,7 +502,7 @@ function IntakeFlow({ switchToCheckin }) {
       <div className="flex items-start gap-3 rounded-lg bg-brand-bg p-4">
         <i className="ti ti-info-circle text-brand text-lg shrink-0 mt-0.5" />
         <p className="text-sm text-ink-soft leading-relaxed">
-          PhysioFusion is a coaching and tracking tool, not a substitute for your
+          SteadyPT is a coaching and tracking tool, not a substitute for your
           physical therapist. We don't diagnose or prescribe exercises.
         </p>
       </div>
@@ -520,7 +597,7 @@ function IntakeFlow({ switchToCheckin }) {
 //  ROOT COMPONENT
 // ══════════════════════════════════════════════════════════════════════
 
-export default function CheckIn({ setScreen }) {
+export default function CheckIn({ setScreen, workout, setWorkout, setWorkoutPos }) {
   const [mode, setMode] = useState("checkin")
   const [micAvailable, setMicAvailable] = useState(false)
 
@@ -556,6 +633,9 @@ export default function CheckIn({ setScreen }) {
       setScreen={setScreen}
       switchToIntake={() => setMode("intake")}
       micAvailable={micAvailable}
+      workout={workout}
+      setWorkout={setWorkout}
+      setWorkoutPos={setWorkoutPos}
     />
   )
 }

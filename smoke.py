@@ -1,5 +1,5 @@
 """
-Headless smoke tests for the PhysioFusion rep counter.
+Headless smoke tests for the SteadyPT rep counter.
 
 No webcam, no MediaPipe — synthesizes knee-angle traces and feeds them into
 SquatCounter directly. This is the layer where the "10 phantom reps while
@@ -692,7 +692,7 @@ def t29_voice_agent_fallback():
 # Main.
 # ---------------------------------------------------------------------------
 def main() -> int:
-    print("PhysioFusion rep-counter smoke tests")
+    print("SteadyPT rep-counter smoke tests")
     print(f"  FPS={FPS} DEBOUNCE_FRAMES={DEBOUNCE_FRAMES} "
           f"DOWN<{DOWN_ENTER_DEG}° UP>{UP_ENTER_DEG}° "
           f"MIN_REP_SEC={MIN_REP_SEC}s")

@@ -1,5 +1,5 @@
 """
-PhysioFusion — mock_state.py
+SteadyPT — mock_state.py
 
 A fake data generator for the UI (Agent C) so the dashboard can be built and
 demoed without the camera, IMU, or pose core.

@@ -1,4 +1,4 @@
-# PhysioFusion — Project Context (read this first, every agent)
+# SteadyPT — Project Context (read this first, every agent)
 
 You are one of three parallel agents building a hackathon project in 24 hours. This file is the
 single source of truth. Do not invent architecture that contradicts it. If something here is

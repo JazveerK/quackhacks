@@ -1,5 +1,5 @@
 """
-PhysioFusion — backend text-to-speech (ElevenLabs).
+SteadyPT — backend text-to-speech (ElevenLabs).
 
 A single pure function, `synthesize(text) -> bytes | None`, that turns a debrief
 string into MP3 audio via ElevenLabs. Used by the `/tts` server endpoint so the

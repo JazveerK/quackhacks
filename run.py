@@ -1,5 +1,5 @@
 """
-Launcher for the PhysioFusion local server.
+Launcher for the SteadyPT local server.
 
 Two jobs before uvicorn starts:
 
@@ -24,6 +24,7 @@ import os
 import subprocess
 import sys
 import time
+from typing import Optional
 
 import cv2
 
@@ -70,12 +71,24 @@ def _camera_hint(name: str) -> str:
     return ""
 
 
+def _iphone_camera_index(cams: list[str]) -> Optional[int]:
+    """Index of the iPhone / Continuity Camera in the device list, or None."""
+    for i, name in enumerate(cams):
+        low = name.lower()
+        if "iphone" in low or "continuity" in low:
+            return i
+    return None
+
+
 def choose_camera() -> int:
     """Resolve which camera index to use.
 
-    Priority: an explicit PF_CAMERA env var wins; otherwise, on an interactive
-    macOS terminal with more than one camera, prompt; in every other case
-    default to index 0.
+    SteadyPT is built around the iPhone (Continuity Camera) because it can be
+    placed at your side for a full side-on view; the MacBook's built-in camera
+    can't. So we auto-select the iPhone and never prompt. Priority:
+      1. an explicit PF_CAMERA env var (escape hatch for non-interactive runs),
+      2. the iPhone / Continuity Camera by name,
+      3. fall back to index 0 if no iPhone is connected.
     """
     env = os.environ.get("PF_CAMERA")
     if env is not None and env.strip() != "":
@@ -86,26 +99,17 @@ def choose_camera() -> int:
 
     cams = list_macos_cameras()
 
-    # Non-interactive (piped/cron) or nothing to disambiguate -> default 0.
-    if not sys.stdin.isatty() or len(cams) <= 1:
-        if cams:
-            print(f"[run] using camera 0: {cams[0]}{_camera_hint(cams[0])}")
-        return 0
+    idx = _iphone_camera_index(cams)
+    if idx is not None:
+        print(f"[run] using iPhone camera {idx}: {cams[idx]}{_camera_hint(cams[idx])}")
+        return idx
 
-    print("\n[run] Multiple cameras detected — which should PhysioFusion use?")
-    for i, name in enumerate(cams):
-        print(f"   [{i}] {name}{_camera_hint(name)}")
-    while True:
-        choice = input(f"[run] camera index [0-{len(cams) - 1}] (default 0): ").strip()
-        if choice == "":
-            return 0
-        try:
-            idx = int(choice)
-            if 0 <= idx < len(cams):
-                return idx
-        except ValueError:
-            pass
-        print("[run] invalid choice, try again.")
+    if cams:
+        print(f"[run] no iPhone / Continuity Camera detected — falling back to "
+              f"camera 0: {cams[0]}{_camera_hint(cams[0])}")
+        print("      Connect your iPhone (same Apple ID, Wi-Fi + Bluetooth on) and "
+              "re-run, or set PF_CAMERA=<n> to force a device.")
+    return 0
 
 
 def preflight_camera(index: int) -> bool:

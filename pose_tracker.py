@@ -1,5 +1,5 @@
 """
-PhysioFusion backend core — Agent B.
+SteadyPT backend core — Agent B.
 
 Pose tracking + squat rep state machine + camera/IMU fusion + per-set summary.
 
@@ -67,6 +67,11 @@ VIS_THRESHOLD = 0.6             # avg leg-landmark visibility for camera-trusted
 LANDMARK_VIS_FLOOR = 0.4        # every leg landmark must clear this
 TORSO_VIS_THRESHOLD = 0.5       # shoulder visibility for "in frame" check
 SIDE_VIEW_SPREAD_MAX = 0.30     # shoulder/hip horiz spread / torso height (side-on)
+FRONT_VIEW_SPREAD_MIN = 0.45    # front-on exercises need at least this spread / torso
+                                # height, else the user is angled away from the camera
+VIEW_CHECK_EXTENSION_BAND = 22  # only judge driving-limb foreshortening when the
+                                # joint is within this many deg of its rest (extended)
+                                # angle — mid-rep bend legitimately shortens the limb
 NO_POSE_SETUP_SEC = 2.0         # seconds without any pose -> "step into frame"
 STALE_FRAME_SEC = 2.0           # seconds without a fresh camera frame -> error
 DEBOUNCE_FRAMES = 3             # consecutive frames past threshold to flip phase
@@ -80,6 +85,11 @@ ANGLE_EMA_ALPHA = 0.30          # EMA smoothing for angle (0..1, higher = snappi
 # advances to the next set. Gestures are confirmed over consecutive frames with
 # a cooldown so a stray frame can't fire them.
 COUNTDOWN_SEC = 3.0             # 3-2-1 countdown after the start trigger
+# A button/voice start is held until the camera angle is confirmed right for the
+# exercise (these are the setup codes that mean framing + angle have passed). The
+# grace timeout is a safety valve so a flaky pose lock can't strand the user.
+START_OK_CODES = frozenset({"ok", "low_visibility"})
+START_GRACE_SEC = 15.0         # proceed even if the angle stays unconfirmed this long
 GESTURE_CONFIRM_FRAMES = 6      # consecutive thumbs-up frames to START / advance
 END_GESTURE_CONFIRM_FRAMES = 14 # stricter hold to END a live set (avoid accidents)
 GESTURE_COOLDOWN_SEC = 2.0      # ignore repeat gestures within this window
@@ -529,6 +539,7 @@ class PoseTracker:
 
         # Gesture + countdown state.
         self._start_requested = False          # external start (voice / button)
+        self._start_deadline: Optional[float] = None  # grace cutoff for a held start
         self._next_requested = False           # external advance during DEBRIEF
         self._thumb_frames = 0                 # consecutive thumbs-up frames
         self._thumbs_up_now = False            # this frame's raw detection
@@ -558,15 +569,27 @@ class PoseTracker:
 
         Honored from WAITING_FOR_START (begins the countdown) and from DEBRIEF
         (advances to the next set, then waits for its start). Ignored mid-set.
+
+        The request is LATCHED, not fired immediately: the countdown only begins
+        once the camera angle is confirmed right for the exercise (see the
+        WAITING_FOR_START transition), so a set never starts from a steep or
+        wrong-facing camera. A grace timeout is the safety valve.
         """
         if self.phase == "WAITING_FOR_START":
             self._start_requested = True
+            self._start_deadline = None
         elif self.phase in ("DEBRIEF", "SET_END"):
             self._next_requested = True
 
     def next_set(self) -> None:
         """External trigger to advance to the next set after a debrief."""
         self._next_requested = True
+
+    def _begin_countdown(self, now: float) -> None:
+        """Enter the 3-2-1 countdown into SET_ACTIVE."""
+        self._thumb_frames = 0
+        self.phase = "COUNTDOWN"
+        self._countdown_start = now
 
     def stop(self) -> None:
         self._stop = True
@@ -701,6 +724,7 @@ class PoseTracker:
         self._occlusion_events = 0
         # Gesture / countdown reset.
         self._start_requested = False
+        self._start_deadline = None
         self._next_requested = False
         self._thumb_frames = 0
         self._countdown_start = None
@@ -752,6 +776,8 @@ class PoseTracker:
         leg_vis_min: float,
         camera_trusted: bool,
         now: float,
+        joint_pts: Optional[tuple] = None,
+        cam_angle: Optional[float] = None,
     ) -> dict:
         """Return a setup_status dict shaped: {ok, severity, code, hint}.
 
@@ -805,17 +831,55 @@ class PoseTracker:
                 "hint": "Position the camera so your whole body is visible.",
             }
 
-        # Side-view check: in side view shoulders/hips overlap heavily in x.
-        # In front view they spread out. Normalize spread by torso height.
+        # Camera-angle / foreshortening guard. A steep or top-down camera points
+        # along the axis the rep travels (e.g. a phone propped on a table looking
+        # DOWN at a push-up), so the driving limb collapses in the image and its
+        # angle — hence depth — reads far shallower than it really is. We catch it
+        # by comparing the projected driving-limb length to torso length, but only
+        # while the limb is near its extended/rest angle (mid-rep bending shortens
+        # it for real). The floor is per-spec: squat/push-up pin their own, and a
+        # documentation-generated exercise derives one from its `view`. This runs
+        # BEFORE the side-view check so a steep camera gets the precise hint
+        # instead of a confusing "turn sideways".
+        ratio_min = self.exercise_spec.view_check_ratio()
+        if ratio_min > 0.0 and joint_pts is not None and cam_angle is not None:
+            sgn = self._sgn
+            start = self.exercise_spec.rep_definition.start_angle_deg
+            limb_extended = sgn * cam_angle <= sgn * start + VIEW_CHECK_EXTENSION_BAND
+            if limb_extended:
+                pa, pb, pc = joint_pts
+                limb_len = (math.hypot(pa[0] - pb[0], pa[1] - pb[1])
+                            + math.hypot(pb[0] - pc[0], pb[1] - pc[1]))
+                torso_len = math.hypot(
+                    ((ls.x + rs.x) - (lh.x + rh.x)) / 2.0,
+                    ((ls.y + rs.y) - (lh.y + rh.y)) / 2.0,
+                )
+                if torso_len > 1e-3 and (limb_len / torso_len) < ratio_min:
+                    return {
+                        "ok": False, "severity": "warning", "code": "steep_camera_angle",
+                        "hint": "Camera's angled too steeply — set it at your side, "
+                                "level with your body, so it can see your depth.",
+                    }
+
+        # Facing check — keyed to the angle the exercise needs. In a side view
+        # shoulders/hips overlap heavily in x; in a front view they spread out.
+        # Normalize the spread by torso height so distance doesn't matter, then
+        # require the spread the spec's `view` calls for. This is what makes the
+        # camera angle right *for this exercise* rather than one-size-fits-all.
         sh_spread = abs(ls.x - rs.x)
         hip_spread = abs(lh.x - rh.x)
         torso_h = abs(((ls.y + rs.y) / 2.0) - ((lh.y + rh.y) / 2.0))
         if torso_h > 1e-3:
             spread = max(sh_spread, hip_spread) / torso_h
-            if spread > SIDE_VIEW_SPREAD_MAX:
+            if self.exercise_spec.view == "side" and spread > SIDE_VIEW_SPREAD_MAX:
                 return {
                     "ok": False, "severity": "warning", "code": "not_side_view",
                     "hint": "Turn sideways to the camera (we need a side view).",
+                }
+            if self.exercise_spec.view == "front" and spread < FRONT_VIEW_SPREAD_MIN:
+                return {
+                    "ok": False, "severity": "warning", "code": "not_front_view",
+                    "hint": "Face the camera straight on (we need a front view).",
                 }
 
         if not camera_trusted:
@@ -1288,7 +1352,7 @@ class PoseTracker:
                     print(f"[pose_tracker] encode error: {e}")
 
                 if self.show_window:
-                    cv2.imshow("PhysioFusion (q to quit)", frame)
+                    cv2.imshow("SteadyPT (q to quit)", frame)
                     if cv2.waitKey(1) & 0xFF == ord("q"):
                         break
         finally:
@@ -1326,10 +1390,12 @@ class PoseTracker:
         leg_vis_min = 0.0
         cam_angle: Optional[float] = None
         landmarks = None
+        joint_pts: Optional[tuple] = None
         if result.pose_landmarks:
             landmarks = result.pose_landmarks.landmark
             self._last_pose_t = now
             leg_vis, leg_vis_min, ja, jb, jc = self._extract_limb(landmarks)
+            joint_pts = (ja, jb, jc)
             a_px = (ja[0] * w, ja[1] * h)
             b_px = (jb[0] * w, jb[1] * h)
             c_px = (jc[0] * w, jc[1] * h)
@@ -1361,7 +1427,8 @@ class PoseTracker:
 
         # ---- Setup status (camera framing / no-person feedback) ----
         setup_status = self._classify_setup(
-            landmarks, leg_vis, leg_vis_min, camera_trusted, now
+            landmarks, leg_vis, leg_vis_min, camera_trusted, now,
+            joint_pts=joint_pts, cam_angle=cam_angle,
         )
         self._last_setup = setup_status
 
@@ -1408,17 +1475,22 @@ class PoseTracker:
         # ---- Lifecycle transitions (gesture / countdown / external) ----
         countdown_remaining: Optional[float] = None
         if self.phase == "WAITING_FOR_START":
-            # Start on a thumbs-up held while correctly positioned, or on an
-            # external start (voice / button — allowed regardless of framing).
-            gesture_start = (
-                bool(setup_status.get("ok"))
-                and self._gesture_confirmed(GESTURE_CONFIRM_FRAMES, now)
-            )
-            if gesture_start or self._start_requested:
-                self._start_requested = False
-                self._thumb_frames = 0
-                self.phase = "COUNTDOWN"
-                self._countdown_start = now
+            # The camera angle is confirmed once framing + the per-exercise view
+            # checks pass — that's exactly the setup codes in START_OK_CODES.
+            camera_ready = setup_status.get("code") in START_OK_CODES
+            # A voice / button start is held until the angle checks out, so a set
+            # never begins from a steep or wrong-facing camera. A grace timeout is
+            # a safety valve so a flaky pose lock can't strand the user forever.
+            if self._start_requested:
+                if self._start_deadline is None:
+                    self._start_deadline = now + START_GRACE_SEC
+                if camera_ready or now >= self._start_deadline:
+                    self._start_requested = False
+                    self._start_deadline = None
+                    self._begin_countdown(now)
+            # Legacy gesture start (kept for compatibility) also gates on the angle.
+            elif camera_ready and self._gesture_confirmed(GESTURE_CONFIRM_FRAMES, now):
+                self._begin_countdown(now)
         elif self.phase == "COUNTDOWN":
             elapsed = now - (self._countdown_start or now)
             countdown_remaining = max(0.0, COUNTDOWN_SEC - elapsed)
@@ -1546,6 +1618,8 @@ class PoseTracker:
             "tracking_source": tracking_source,
             "rep_depths": list(self.counter.rep_depths),
             "setup_status": setup_status,
+            # A start is queued but held until the camera angle is confirmed.
+            "start_pending": bool(self._start_requested),
             "profile": self.profile.to_dict(),
             # Gesture + lifecycle hints for the dashboard.
             "gesture": "thumbs_up" if self._thumbs_up_now else None,

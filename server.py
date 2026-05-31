@@ -1,5 +1,5 @@
 """
-PhysioFusion local server.
+SteadyPT local server.
 
 Runs the PoseTracker on a daemon thread, broadcasts per-frame state JSON,
 JPEG frames, set summaries, profile updates, and the AI debrief follow-up
@@ -23,6 +23,16 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+
+# Load .env into the process environment BEFORE anything reads a key. Without
+# this the Gemini voice agent silently runs in keyword-only fallback and TTS
+# stays disabled even when .env holds valid keys. Existing env vars win, so an
+# explicitly-exported key still overrides the file.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent / ".env")
+except ImportError:
+    pass
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import FileResponse, JSONResponse, Response

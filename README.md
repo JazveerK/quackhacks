@@ -1,4 +1,4 @@
-# PhysioFusion
+# SteadyPT
 
 AI physical-therapy coach: webcam + thigh-mounted IMU track bodyweight squats, with
 sensor-fusion fallback when the camera loses sight of the thigh, an end-of-set Gemini

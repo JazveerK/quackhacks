@@ -1,4 +1,4 @@
-# PhysioFusion — Frontend Handoff
+# SteadyPT — Frontend Handoff
 
 This doc is everything you need to build the dashboard (and later the PT view,
 voice playback, Gemini debrief, and BigQuery writes) against the existing

@@ -1,18 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 /**
- * Voice coach hook.
+ * Hands-free speech I/O for the voice assistant.
  *
- * - Listening: Web Speech API (SpeechRecognition). Each finalized utterance is
- *   sent to the backend as { cmd: 'say', text } so the Gemini agent can reply
- *   and drive the session (start/end/next set, end session).
- * - Speaking: speak(text) tries the server's /tts (ElevenLabs) for a natural
- *   voice and falls back to the browser's built-in SpeechSynthesis. Voice is
- *   never load-bearing — if everything fails it just stays silent.
+ * Listening: Web Speech API (SpeechRecognition), continuous + auto-restarting
+ *   (Chrome drops recognition every ~minute). Interim results stream to
+ *   `onInterim(text)`; each finalized utterance fires `onFinal(text)`. The
+ *   caller decides what to do with them (send to the agent, drive status, …).
+ * Speaking: speak(text) hits the server's /tts (ElevenLabs) for a natural voice
+ *   and falls back to the browser's SpeechSynthesis. Recognition is muted while
+ *   speaking so the coach's own voice doesn't feed back into the mic.
  *
- * Returns { supported, listening, toggle, start, stop, transcript, speak, speaking }.
+ * Returns { supported, listening, start, stop, toggle, speak, cancelSpeak, speaking }.
  */
-export default function useVoice(send) {
+export default function useVoice({ onFinal, onInterim } = {}) {
   const RecognitionCtor =
     typeof window !== 'undefined'
       ? window.SpeechRecognition || window.webkitSpeechRecognition
@@ -21,10 +22,16 @@ export default function useVoice(send) {
 
   const [listening, setListening] = useState(false)
   const [speaking, setSpeaking] = useState(false)
-  const [transcript, setTranscript] = useState('')
+
   const recRef = useRef(null)
-  const wantRef = useRef(false) // user intends to keep listening (auto-restart)
+  const wantRef = useRef(false)      // user intends to keep listening (auto-restart)
+  const speakingRef = useRef(false)  // gate mic input while the coach talks
   const audioRef = useRef(null)
+  // Keep the latest callbacks without re-creating the recognizer each render.
+  const finalRef = useRef(onFinal)
+  const interimRef = useRef(onInterim)
+  useEffect(() => { finalRef.current = onFinal }, [onFinal])
+  useEffect(() => { interimRef.current = onInterim }, [onInterim])
 
   useEffect(() => {
     if (!supported) return
@@ -34,21 +41,22 @@ export default function useVoice(send) {
     rec.lang = 'en-US'
 
     rec.onresult = (e) => {
+      // Drop anything captured while the coach is speaking — that's just the
+      // TTS bleeding back through the mic, not the patient.
+      if (speakingRef.current) return
       let interim = ''
       for (let i = e.resultIndex; i < e.results.length; i++) {
         const r = e.results[i]
         const text = r[0].transcript.trim()
         if (r.isFinal) {
-          if (text) send?.({ cmd: 'say', text })
-          setTranscript(text)
+          if (text) finalRef.current?.(text)
         } else {
           interim += text
         }
       }
-      if (interim) setTranscript(interim)
+      if (interim) interimRef.current?.(interim)
     }
     rec.onend = () => {
-      // Chrome stops recognition periodically; restart if the user still wants it.
       if (wantRef.current) {
         try { rec.start() } catch { /* already starting */ }
       } else {
@@ -66,7 +74,7 @@ export default function useVoice(send) {
       wantRef.current = false
       try { rec.stop() } catch { /* noop */ }
     }
-  }, [supported, send])
+  }, [supported, RecognitionCtor])
 
   const start = useCallback(() => {
     if (!recRef.current) return
@@ -85,13 +93,26 @@ export default function useVoice(send) {
     else start()
   }, [listening, start, stop])
 
+  const cancelSpeak = useCallback(() => {
+    try { audioRef.current?.pause() } catch { /* noop */ }
+    audioRef.current = null
+    if (typeof window !== 'undefined') window.speechSynthesis?.cancel()
+    speakingRef.current = false
+    setSpeaking(false)
+  }, [])
+
   const speak = useCallback(async (text) => {
     if (!text) return
-    // Stop any in-flight speech first.
-    try { audioRef.current?.pause() } catch { /* noop */ }
-    if (typeof window !== 'undefined') window.speechSynthesis?.cancel()
-
+    cancelSpeak()
+    speakingRef.current = true
     setSpeaking(true)
+
+    const done = () => {
+      speakingRef.current = false
+      setSpeaking(false)
+      audioRef.current = null
+    }
+
     try {
       const res = await fetch('/tts', {
         method: 'POST',
@@ -99,12 +120,11 @@ export default function useVoice(send) {
         body: JSON.stringify({ text }),
       })
       if (res.ok) {
-        const buf = await res.blob()
-        const url = URL.createObjectURL(buf)
+        const url = URL.createObjectURL(await res.blob())
         const audio = new Audio(url)
         audioRef.current = audio
-        audio.onended = () => { setSpeaking(false); URL.revokeObjectURL(url) }
-        audio.onerror = () => { setSpeaking(false); URL.revokeObjectURL(url) }
+        audio.onended = () => { done(); URL.revokeObjectURL(url) }
+        audio.onerror = () => { done(); URL.revokeObjectURL(url) }
         await audio.play()
         return
       }
@@ -113,13 +133,13 @@ export default function useVoice(send) {
     // Fallback: browser SpeechSynthesis.
     try {
       const u = new SpeechSynthesisUtterance(text)
-      u.onend = () => setSpeaking(false)
-      u.onerror = () => setSpeaking(false)
+      u.onend = done
+      u.onerror = done
       window.speechSynthesis.speak(u)
     } catch {
-      setSpeaking(false)
+      done()
     }
-  }, [])
+  }, [cancelSpeak])
 
-  return { supported, listening, toggle, start, stop, transcript, speak, speaking }
+  return { supported, listening, start, stop, toggle, speak, cancelSpeak, speaking }
 }

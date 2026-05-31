@@ -1,4 +1,4 @@
-# PhysioFusion — Voice IN brief (Agent C)
+# SteadyPT — Voice IN brief (Agent C)
 
 Hands-free voice commands for the dashboard. The user (patient) talks to the
 app while squatting; their voice triggers a small fixed vocabulary of
