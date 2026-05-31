@@ -1,10 +1,13 @@
 import { useState, useRef, useCallback } from "react"
 import GhostButton from "./GhostButton"
-import PoseMatchOverlay from "../coach/PoseMatchOverlay"
 
 const VIDEO_URL = import.meta.env.VITE_VIDEO_URL
 
-export default function CameraPanel({ frame, targetDeg, landmarks }) {
+// The live feed shows the backend-rendered skeleton (drawn into the JPEG).
+// The pose-match SVG overlay lives only in the setup "get into position"
+// guide — drawing it here too would double the skeleton and the coaching
+// banner over the same feed.
+export default function CameraPanel({ frame }) {
   const [imgError, setImgError] = useState(false)
   const [webcamActive, setWebcamActive] = useState(false)
   const videoRef = useRef(null)
@@ -13,8 +16,6 @@ export default function CameraPanel({ frame, targetDeg, landmarks }) {
   const showStream = VIDEO_URL && !imgError
   const showWebcam = webcamActive
   const showPlaceholder = !showStream && !showWebcam && !frame
-
-  const target = targetDeg ?? 95
 
   const toggleWebcam = useCallback(async () => {
     if (webcamActive) {
@@ -96,16 +97,6 @@ export default function CameraPanel({ frame, targetDeg, landmarks }) {
             <div className="text-[12px] text-white/25 mt-1">Stand to the side, full body in frame</div>
           </div>
         </div>
-      )}
-
-      {/* Pose match overlay — skeleton + ghost */}
-      {landmarks && landmarks.length >= 33 && (
-        <PoseMatchOverlay
-          landmarks={landmarks}
-          targetDepthDeg={target}
-          width={640}
-          height={480}
-        />
       )}
 
       {/* DEV-ONLY webcam toggle */}

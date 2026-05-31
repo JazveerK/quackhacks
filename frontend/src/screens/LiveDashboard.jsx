@@ -216,11 +216,7 @@ export default function LiveDashboard({ setScreen, workout = [], workoutPos = { 
 
         {/* Camera hero — takes remaining space */}
         <div className="relative flex-1 min-h-[280px] min-w-0">
-          <CameraPanel
-            frame={frame}
-            targetDeg={target}
-            landmarks={state.pose_landmarks}
-          />
+          <CameraPanel frame={frame} />
           {phase === "WAITING_FOR_START" && <CameraCheck state={state} />}
           {phase === "SET_ACTIVE" && state.setup_status?.severity === "blocking" && (
             <CameraLostOverlay setup={state.setup_status} />
