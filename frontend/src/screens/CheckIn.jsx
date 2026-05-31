@@ -3,6 +3,7 @@ import Card from "../components/Card"
 import Chip from "../components/Chip"
 import GhostButton from "../components/GhostButton"
 import PrimaryButton from "../components/PrimaryButton"
+import { useSession } from "../SocketContext"
 
 // ── Speech recognition (on-device only) ──────────────────────────────
 const SR = typeof window !== "undefined"
@@ -17,11 +18,94 @@ const PAIN_OPTIONS = ["None", "Mild", "Moderate", "Sharp"]
 const READY_OPTIONS = ["Yes, let's go", "Give me a minute"]
 
 function CheckInFlow({ setScreen, switchToIntake, micAvailable }) {
+  const { state, send } = useSession()
+
   const [kneeScore, setKneeScore] = useState(null)
   const [pain, setPain] = useState(null)
   const [ready, setReady] = useState(null)
   const [listening, setListening] = useState(false)
   const recRef = useRef(null)
+
+  // ── Exercise selection ─────────────────────────────────────────────
+  const [exercises, setExercises] = useState([])
+  const [exLoadError, setExLoadError] = useState(null)
+  const [docOpen, setDocOpen] = useState(false)
+  const [docText, setDocText] = useState("")
+  const [generating, setGenerating] = useState(false)
+  const [genError, setGenError] = useState(null)
+  const [genSuccess, setGenSuccess] = useState(null)
+
+  // Active exercise id comes from live session state once a frame arrives.
+  const activeId = state?.exercise ?? null
+  const activeExercise = exercises.find((e) => e.id === activeId) || null
+  const activeName = activeExercise?.display_name || activeId || null
+
+  // Fetch the catalogue of exercises.
+  const fetchExercises = useCallback(async () => {
+    try {
+      const res = await fetch("/exercises")
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json()
+      const list = Array.isArray(data?.exercises) ? data.exercises : []
+      setExercises(list)
+      setExLoadError(null)
+      return data
+    } catch {
+      setExLoadError("Couldn't load exercises. Check your connection.")
+      return null
+    }
+  }, [])
+
+  useEffect(() => {
+    fetchExercises()
+  }, [fetchExercises])
+
+  // Pick an exercise from the dropdown.
+  const handleSelect = useCallback(
+    (id) => {
+      if (!id) return
+      send({ cmd: "select_exercise", id })
+      setGenSuccess(null)
+      setGenError(null)
+    },
+    [send]
+  )
+
+  // Generate a new exercise spec from pasted documentation.
+  const handleGenerate = useCallback(async () => {
+    const text = docText.trim()
+    if (!text || generating) return
+    setGenerating(true)
+    setGenError(null)
+    setGenSuccess(null)
+    try {
+      const res = await fetch("/exercise/load", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (data?.source === "generated") {
+        // Re-fetch the catalogue, then select the newly loaded exercise.
+        const refreshed = await fetchExercises()
+        const newId = data?.active ?? refreshed?.active ?? data?.spec?.id ?? null
+        if (newId) handleSelect(newId)
+        const name = data?.spec?.display_name || newId || "exercise"
+        setGenSuccess(`Loaded "${name}" from your documentation.`)
+        setGenError(null)
+      } else {
+        // Fallback / default — surface the backend's explanation.
+        setGenError(
+          data?.error ||
+            "Couldn't generate an exercise from that text. Try adding more detail."
+        )
+      }
+    } catch {
+      setGenError("Something went wrong while generating. Please try again.")
+    } finally {
+      setGenerating(false)
+    }
+  }, [docText, generating, fetchExercises, handleSelect])
 
   // Which question is "active" (first unanswered)
   const activeQ = kneeScore == null ? 1 : pain == null ? 2 : ready == null ? 3 : 3
@@ -186,6 +270,91 @@ function CheckInFlow({ setScreen, switchToIntake, micAvailable }) {
         </div>
       </Card>
 
+      {/* Exercise selection */}
+      <Card>
+        <div className="flex items-center gap-2 mb-3">
+          <i className="ti ti-stretching text-brand text-lg" />
+          <h3 className="text-sm font-medium text-ink">
+            Which exercise are we doing?
+          </h3>
+        </div>
+
+        {exLoadError && (
+          <div className="flex items-start gap-2 rounded-lg bg-surface p-3 mb-3">
+            <i className="ti ti-alert-triangle text-ink-faint text-sm shrink-0 mt-0.5" />
+            <p className="text-xs text-ink-soft">{exLoadError}</p>
+          </div>
+        )}
+
+        <select
+          value={activeId || ""}
+          onChange={(e) => handleSelect(e.target.value)}
+          className="w-full px-3 py-2 rounded-lg border border-hair bg-white text-sm text-ink focus:outline-none focus:ring-1 focus:ring-brand"
+        >
+          <option value="" disabled>
+            {exercises.length ? "Choose an exercise…" : "No exercises available"}
+          </option>
+          {exercises.map((ex) => (
+            <option key={ex.id} value={ex.id}>
+              {ex.display_name}
+            </option>
+          ))}
+        </select>
+
+        {/* Collapsible: generate from documentation */}
+        <button
+          type="button"
+          onClick={() => setDocOpen((v) => !v)}
+          className="flex items-center gap-1.5 mt-3 text-xs text-ink-soft hover:text-ink transition-colors"
+        >
+          <i
+            className={`ti ti-chevron-right text-sm transition-transform ${
+              docOpen ? "rotate-90" : ""
+            }`}
+          />
+          New exercise from documentation
+        </button>
+
+        {docOpen && (
+          <div className="mt-3 flex flex-col gap-3">
+            <textarea
+              value={docText}
+              onChange={(e) => setDocText(e.target.value)}
+              placeholder="Paste exercise instructions or notes from your PT…"
+              rows={4}
+              disabled={generating}
+              className="w-full px-3 py-2 rounded-lg border border-hair bg-white text-sm text-ink placeholder:text-ink-faint resize-none focus:outline-none focus:ring-1 focus:ring-brand disabled:opacity-50"
+            />
+
+            {genSuccess && (
+              <div className="flex items-start gap-2 rounded-lg bg-ok-bg p-3">
+                <i className="ti ti-check text-ok text-sm shrink-0 mt-0.5" />
+                <p className="text-xs text-ok">{genSuccess}</p>
+              </div>
+            )}
+            {genError && (
+              <div className="flex items-start gap-2 rounded-lg bg-surface p-3">
+                <i className="ti ti-alert-triangle text-ink-faint text-sm shrink-0 mt-0.5" />
+                <p className="text-xs text-ink-soft">{genError}</p>
+              </div>
+            )}
+
+            <div className="flex justify-end">
+              <PrimaryButton
+                onClick={handleGenerate}
+                className={
+                  !docText.trim() || generating
+                    ? "opacity-50 pointer-events-none"
+                    : ""
+                }
+              >
+                {generating ? "Generating…" : "Generate & load"}
+              </PrimaryButton>
+            </div>
+          </div>
+        )}
+      </Card>
+
       {/* Footer */}
       <div className="flex items-center justify-between">
         <button
@@ -195,9 +364,26 @@ function CheckInFlow({ setScreen, switchToIntake, micAvailable }) {
         >
           First time? Set up profile
         </button>
-        <PrimaryButton onClick={() => setScreen("live")} arrow>
-          Start session
-        </PrimaryButton>
+        <div className="flex items-center gap-3">
+          {activeName ? (
+            <span className="text-xs text-ink-soft">
+              Loaded:{" "}
+              <span className="font-medium text-ink">{activeName}</span>
+            </span>
+          ) : (
+            <span className="text-xs text-ink-faint">No exercise selected</span>
+          )}
+          <PrimaryButton
+            onClick={() => {
+              send({ cmd: "start_set" })
+              setScreen("live")
+            }}
+            arrow
+            className={!activeId ? "opacity-50 pointer-events-none" : ""}
+          >
+            Start session
+          </PrimaryButton>
+        </div>
       </div>
     </div>
   )

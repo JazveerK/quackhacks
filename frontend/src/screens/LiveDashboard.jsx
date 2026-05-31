@@ -1,5 +1,5 @@
 import { useRef } from "react"
-import { useMockSession } from "../mockSession"
+import { useSession } from "../SocketContext"
 import AppHeader from "../components/AppHeader"
 import GhostButton from "../components/GhostButton"
 import CameraPanel from "../components/CameraPanel"
@@ -17,30 +17,53 @@ const CUES = [
 ]
 
 export default function LiveDashboard({ setScreen }) {
-  const { state } = useMockSession()
+  const { connected, state, frame, send } = useSession()
   const lastRepRef = useRef(0)
   const cueIndexRef = useRef(0)
 
-  if (!state) {
+  // Offline / connecting note — no real data yet.
+  if (!connected || !state) {
     return (
       <div className="flex-1 flex items-center justify-center text-ink-soft text-sm">
-        Connecting…
+        {connected ? "Waiting for session…" : "Connecting…"}
       </div>
     )
   }
 
-  // Advance cue when rep_count increments
-  if (state.rep_count > lastRepRef.current && state.rep_count > 0) {
-    cueIndexRef.current = (state.rep_count - 1) % CUES.length
-    lastRepRef.current = state.rep_count
+  const phase = state.phase
+  const repCount = state.rep_count ?? 0
+
+  // Advance cue when rep_count increments — prefer real backend form flags.
+  if (repCount > lastRepRef.current && repCount > 0) {
+    cueIndexRef.current = (repCount - 1) % CUES.length
+    lastRepRef.current = repCount
   }
-  const cue = state.rep_count > 0 ? CUES[cueIndexRef.current] : null
+  const formFlag =
+    Array.isArray(state.form_flags) && state.form_flags.length > 0
+      ? state.form_flags[0]
+      : null
+  const cue = formFlag ?? (repCount > 0 ? CUES[cueIndexRef.current] : null)
 
   const angle = state.angle ?? 180
-  const target = state.personal_target_depth_deg ?? 95
+  const target = state.target_depth_deg ?? 95
   const tempo = state.tempo ?? 0
   const imuQ = state.imu_quality ?? 0
   const vis = state.landmark_visibility ?? 0
+
+  const exerciseUi = state.exercise_ui ?? {}
+  const exerciseName = exerciseUi.display_name ?? "Exercise"
+  const isActive = phase === "SET_ACTIVE"
+  const canStart = phase === "WAITING_FOR_START" || phase === "DEBRIEF"
+
+  const PHASE_LABEL = {
+    WAITING_FOR_START: "Ready",
+    COUNTDOWN: "Get ready",
+    SET_ACTIVE: "Set active",
+    SET_END: "Set complete",
+    DEBRIEF: "Debrief",
+  }
+  const phaseLabel = PHASE_LABEL[phase] ?? "Live"
+  const phaseColor = isActive ? "green" : "blue"
 
   // Depth status
   let depthLabel, depthVariant
@@ -59,24 +82,40 @@ export default function LiveDashboard({ setScreen }) {
     <div className="flex flex-col h-full">
       {/* Header */}
       <AppHeader
-        context={["Bodyweight squat", "Set 2 of 3"]}
-        phase="Set active"
-        phaseColor="green"
+        context={[exerciseName, `${repCount} / ${state.rep_target ?? "—"} reps`]}
+        phase={phaseLabel}
+        phaseColor={phaseColor}
       >
-        <GhostButton onClick={() => setScreen("debrief")}>
-          <i className="ti ti-player-stop text-sm" />
-          End set
-        </GhostButton>
+        {isActive ? (
+          <GhostButton onClick={() => send({ cmd: "end_set" })}>
+            <i className="ti ti-player-stop text-sm" />
+            End set
+          </GhostButton>
+        ) : canStart ? (
+          <GhostButton onClick={() => send({ cmd: "start_set" })}>
+            <i className="ti ti-player-play text-sm" />
+            Start set
+          </GhostButton>
+        ) : null}
       </AppHeader>
 
       {/* 3-column grid */}
       <div className="flex-1 grid grid-cols-[3fr_1.25fr_0.75fr] gap-3 p-3 min-h-0">
         {/* Camera (60%) */}
-        <CameraPanel frame={null} />
+        <div className="relative min-h-0">
+          <CameraPanel frame={frame} />
+          {phase === "COUNTDOWN" && (
+            <div className="absolute inset-0 flex items-center justify-center bg-ink/40 rounded-lg">
+              <span className="text-white text-7xl font-medium tabular-nums leading-none">
+                {state.countdown ?? ""}
+              </span>
+            </div>
+          )}
+        </div>
 
         {/* Metrics (25%) */}
         <div className="flex flex-col gap-3 min-h-0 overflow-y-auto">
-          <RepCounter state={state} />
+          <RepCounter state={state} profile={state?.profile} />
 
           {/* Knee depth — inline version with arc gauge */}
           <div className="bg-white rounded-lg border border-hair p-4">
@@ -105,7 +144,7 @@ export default function LiveDashboard({ setScreen }) {
 
         {/* Sidebar — fusion (15%) */}
         <div className="flex flex-col gap-3 min-h-0 overflow-y-auto">
-          <TrackingSource state={state} />
+          <TrackingSource state={state} profile={state?.profile} />
 
           {/* IMU quality */}
           <div className="bg-white rounded-lg border border-hair p-4">
