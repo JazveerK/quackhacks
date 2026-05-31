@@ -8,6 +8,10 @@ export default function useSocket() {
   const [summary, setSummary] = useState(null)
   const [aiDebrief, setAiDebrief] = useState(null)
   const [profile, setProfile] = useState(null)
+  // Voice-agent reply. Wrapped with a monotonic seq so the same spoken text
+  // twice in a row still triggers a fresh effect (play TTS, surface report).
+  const [agentReply, setAgentReply] = useState(null)
+  const seqRef = useRef(0)
 
   useEffect(() => {
     let reconnectMs = 500
@@ -49,6 +53,10 @@ export default function useSocket() {
           case 'profile':
             setProfile(msg.profile)
             break
+          case 'agent_reply':
+            seqRef.current += 1
+            setAgentReply({ ...msg, seq: seqRef.current })
+            break
         }
       }
     }
@@ -67,5 +75,8 @@ export default function useSocket() {
     }
   }, [])
 
-  return { connected, state, frame, summary, aiDebrief, profile, send, setSummary }
+  return {
+    connected, state, frame, summary, aiDebrief, profile, agentReply,
+    send, setSummary, setAgentReply,
+  }
 }

@@ -12,7 +12,7 @@ export default function CameraFeed({ frame, state }) {
   }, [frame])
 
   return (
-    <div className="relative bg-[#1a1a1a] rounded-xl overflow-hidden flex items-center justify-center min-h-0">
+    <div className="relative bg-[#1a1a1a] rounded-xl overflow-hidden flex items-center justify-center min-h-0 w-full h-full">
       {frame ? (
         <img
           ref={imgRef}

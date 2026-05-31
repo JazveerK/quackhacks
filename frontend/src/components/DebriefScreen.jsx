@@ -1,9 +1,15 @@
 import { useState } from 'react'
 
-export default function DebriefScreen({ summary, aiDebrief, profile, onStartNext }) {
+export default function DebriefScreen({
+  summary, aiDebrief, profile, onStartNext, onEndSession,
+  setsCompleted = 0, totalSets = 3,
+}) {
   const [showClinical, setShowClinical] = useState(false)
 
   if (!summary) return null
+
+  const lastSet = setsCompleted >= totalSets
+  const setsLeft = Math.max(0, totalSets - setsCompleted)
 
   const reps = summary.reps_completed ?? 0
   const target = summary.rep_target ?? 10
@@ -127,23 +133,37 @@ export default function DebriefScreen({ summary, aiDebrief, profile, onStartNext
         )}
 
         {/* Action bar */}
-        <div className="bg-surface rounded-xl p-5 flex items-center justify-between">
-          <div>
-            <div className="text-sm font-medium text-primary-text">One more set to go</div>
+        <div className="bg-surface rounded-xl p-5 flex items-center justify-between gap-4">
+          <div className="min-w-0">
+            <div className="text-sm font-medium text-primary-text">
+              {lastSet ? 'That was your last set' : setsLeft === 1 ? 'One more set to go' : `${setsLeft} sets to go`}
+            </div>
             <div className="text-xs text-secondary-text mt-0.5">
-              {target} squats · take it a bit slower this time
+              {lastSet
+                ? 'Wrap up to see your session summary'
+                : `${target} squats · take it a bit slower this time`}
             </div>
           </div>
-          <button
-            onClick={onStartNext}
-            className="bg-info text-white text-sm font-medium px-5 py-2 rounded-lg hover:opacity-90 transition-opacity flex items-center gap-1.5"
-          >
-            Start
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <line x1="5" y1="12" x2="19" y2="12" />
-              <polyline points="12 5 19 12 12 19" />
-            </svg>
-          </button>
+          <div className="flex items-center gap-2 shrink-0">
+            {!lastSet && (
+              <button
+                onClick={onEndSession}
+                className="text-sm text-secondary-text border border-border px-4 py-2 rounded-lg hover:bg-surface-white transition-colors"
+              >
+                End session
+              </button>
+            )}
+            <button
+              onClick={lastSet ? onEndSession : onStartNext}
+              className="bg-info text-white text-sm font-medium px-5 py-2 rounded-lg hover:opacity-90 transition-opacity flex items-center gap-1.5"
+            >
+              {lastSet ? 'Finish' : 'Start'}
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <line x1="5" y1="12" x2="19" y2="12" />
+                <polyline points="12 5 19 12 12 19" />
+              </svg>
+            </button>
+          </div>
         </div>
 
         {/* Clinical toggle */}

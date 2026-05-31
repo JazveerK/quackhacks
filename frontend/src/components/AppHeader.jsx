@@ -1,9 +1,11 @@
-export default function AppHeader({ connected, state, profile }) {
-  const phase = state?.phase || 'REST'
-  const setNum = 1 // TODO: track set number across resets
-  const totalSets = profile?.sets || 3
+export default function AppHeader({ connected, state, profile, currentSet, totalSets }) {
+  const phase = state?.phase || 'WAITING_FOR_START'
+  const sets = totalSets || profile?.sets || 3
+  const setNum = currentSet || 1
 
   const phaseLabel = {
+    WAITING_FOR_START: 'Ready',
+    COUNTDOWN: 'Get ready',
     SET_ACTIVE: 'Active',
     SET_END: 'Set complete',
     DEBRIEF: 'Debrief',
@@ -13,6 +15,8 @@ export default function AppHeader({ connected, state, profile }) {
   }[phase] || phase
 
   const dotColor = {
+    WAITING_FOR_START: 'bg-tertiary-text',
+    COUNTDOWN: 'bg-warning',
     SET_ACTIVE: 'bg-success',
     SET_END: 'bg-info',
     DEBRIEF: 'bg-info',
@@ -34,7 +38,11 @@ export default function AppHeader({ connected, state, profile }) {
           </>
         )}
       </div>
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-3">
+        <span className="text-xs text-tertiary-text tabular-nums">
+          Set {setNum} of {sets}
+        </span>
+        <span className="text-tertiary-text text-xs">·</span>
         <span className={`w-2 h-2 rounded-full ${dotColor}`} />
         <span className="text-xs text-secondary-text">{phaseLabel}</span>
         {!connected && (

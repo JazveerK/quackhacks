@@ -1,0 +1,693 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>PhysioFusion — PT Assistant</title>
+<style>
+  :root {
+    --bg: #0b1020; --panel: #131a33; --panel-2: #1a2347;
+    --text: #e8ecf7; --muted: #8c95b8; --accent: #4dd6ff;
+    --good: #4ade80; --warn: #fbbf24; --bad: #f87171; --info: #60a5fa;
+    --imu: #c084fc; --camera: #4dd6ff;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; height: 100%;
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
+  body { display: grid; grid-template-columns: 1fr 400px;
+    grid-template-rows: 56px 1fr; gap: 12px; padding: 12px; }
+  header { grid-column: 1 / -1; display: flex; align-items: center;
+    justify-content: space-between; padding: 0 16px; background: var(--panel);
+    border-radius: 10px; }
+  header h1 { margin: 0; font-size: 18px; letter-spacing: 0.5px;
+    display: flex; align-items: center; gap: 10px; }
+  header h1 .dot { width: 10px; height: 10px; border-radius: 50%;
+    background: var(--bad); box-shadow: 0 0 8px var(--bad); transition: background 0.2s; }
+  header h1 .dot.connected { background: var(--good); box-shadow: 0 0 8px var(--good); }
+  header .right { display: flex; gap: 8px; align-items: center; }
+  .chips { display: flex; gap: 6px; margin-right: 8px; }
+  .chip { font-size: 10px; padding: 3px 8px; border-radius: 999px;
+    background: var(--panel-2); color: var(--muted); border: 1px solid #2c3866;
+    letter-spacing: 0.5px; }
+  .chip.on { color: var(--good); border-color: var(--good); }
+  .chip.off { color: var(--muted); opacity: 0.6; }
+  button { background: var(--panel-2); color: var(--text); border: 1px solid #2c3866;
+    border-radius: 8px; padding: 8px 14px; font-size: 13px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.primary { background: var(--accent); color: #002337; border-color: var(--accent); font-weight: 600; }
+  button.good { background: var(--good); color: #00210f; border-color: var(--good); font-weight: 600; }
+
+  .stage { background: var(--panel); border-radius: 10px; overflow: hidden;
+    position: relative; display: flex; align-items: center; justify-content: center; min-height: 0; }
+  .stage img { width: 100%; height: 100%; object-fit: contain; background: #000; }
+  .stage .no-feed { color: var(--muted); font-size: 14px; }
+
+  /* setup hint banner */
+  .setup-banner { position: absolute; top: 14px; left: 50%; transform: translateX(-50%);
+    padding: 10px 18px; border-radius: 10px; font-size: 15px; font-weight: 600;
+    background: rgba(11,16,32,0.85); border: 1px solid #2c3866; max-width: 80%;
+    text-align: center; transition: all 0.2s; display: flex; align-items: center; gap: 10px; }
+  .setup-banner.good { border-color: var(--good); color: var(--good); }
+  .setup-banner.info { border-color: var(--info); color: var(--info); }
+  .setup-banner.warning { border-color: var(--warn); color: var(--warn); }
+  .setup-banner.blocking { border-color: var(--bad); color: var(--bad); }
+
+  /* form flag */
+  .overlay-flag { position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
+    padding: 12px 22px; background: rgba(11,16,32,0.8); border-left: 4px solid var(--warn);
+    border-radius: 6px; font-size: 22px; font-weight: 700; opacity: 0; transition: opacity 0.2s; }
+  .overlay-flag.show { opacity: 1; }
+
+  /* big center overlay for waiting / countdown */
+  .center-overlay { position: absolute; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 16px; text-align: center;
+    background: rgba(7,10,22,0.55); pointer-events: none; }
+  .center-overlay.hidden { display: none; }
+  .center-overlay .big { font-size: 26px; font-weight: 800; letter-spacing: 0.5px; }
+  .center-overlay .sub { font-size: 15px; color: var(--muted); max-width: 460px; }
+  .center-overlay .thumb-hint { font-size: 64px; line-height: 1; }
+  .countdown-num { font-size: 200px; font-weight: 900; color: var(--accent);
+    text-shadow: 0 0 40px rgba(77,214,255,0.6); line-height: 1; }
+  .center-overlay button { pointer-events: auto; }
+
+  /* gesture pill */
+  .gesture-pill { position: absolute; top: 14px; right: 14px; display: flex; align-items: center;
+    gap: 8px; padding: 8px 12px; border-radius: 999px; background: rgba(11,16,32,0.8);
+    border: 1px solid #2c3866; font-size: 13px; opacity: 0; transition: opacity 0.15s; }
+  .gesture-pill.show { opacity: 1; border-color: var(--good); color: var(--good); }
+  .gesture-ring { width: 28px; height: 28px; border-radius: 50%;
+    background: conic-gradient(var(--good) var(--p,0%), #2c3866 0); }
+
+  .sidebar { display: grid; grid-template-rows: auto auto auto auto auto 1fr;
+    gap: 10px; min-height: 0; overflow-y: auto; }
+  .card { background: var(--panel); border-radius: 10px; padding: 12px 14px; }
+  .card h2 { margin: 0 0 8px 0; font-size: 11px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 1.2px; display: flex; justify-content: space-between; }
+
+  .source { display: flex; align-items: center; gap: 10px; }
+  .source .badge { flex: 1; text-align: center; padding: 12px 6px; border-radius: 10px;
+    font-weight: 700; font-size: 15px; letter-spacing: 1px; border: 2px solid transparent;
+    background: var(--panel-2); color: var(--muted); transition: all 0.25s; }
+  .source .badge.active.camera { border-color: var(--camera); color: var(--camera);
+    box-shadow: 0 0 18px rgba(77,214,255,0.45); background: rgba(77,214,255,0.08); }
+  .source .badge.active.imu { border-color: var(--imu); color: var(--imu);
+    box-shadow: 0 0 18px rgba(192,132,252,0.45); background: rgba(192,132,252,0.08); }
+  .source .arrow { color: var(--muted); font-size: 16px; }
+
+  .counter { display: flex; align-items: baseline; gap: 10px; padding: 4px 2px 0 2px; }
+  .counter .num { font-size: 56px; font-weight: 800; line-height: 1; }
+  .counter .of { font-size: 18px; color: var(--muted); }
+  .counter .phase { margin-left: auto; padding: 4px 10px; border-radius: 999px;
+    background: var(--panel-2); font-size: 10px; color: var(--muted); letter-spacing: 1px; align-self: center; }
+
+  .gauge { position: relative; height: 26px; border-radius: 13px; background: var(--panel-2);
+    overflow: hidden; margin-top: 14px; }
+  .gauge .fill { position: absolute; left: 0; top: 0; bottom: 0;
+    background: linear-gradient(90deg, var(--good), var(--accent)); width: 0%; transition: width 0.12s linear; }
+  .gauge .target { position: absolute; top: -4px; bottom: -4px; width: 2px; background: var(--warn); }
+  .gauge .target::after { content: "TARGET"; position: absolute; top: -15px; left: 4px;
+    font-size: 9px; letter-spacing: 1px; color: var(--warn); white-space: nowrap; }
+  .gauge-row { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); margin-top: 5px; }
+
+  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .stat { background: var(--panel-2); border-radius: 8px; padding: 7px 9px; }
+  .stat .label { font-size: 9px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; }
+  .stat .value { font-size: 16px; font-weight: 600; }
+
+  /* prescription */
+  .rx-line { font-size: 13px; margin: 3px 0; }
+  .rx-line .k { color: var(--muted); }
+  .rx-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+  .rx-tag { font-size: 10px; padding: 2px 7px; border-radius: 999px;
+    background: rgba(248,113,113,0.12); color: var(--bad); border: 1px solid rgba(248,113,113,0.3); }
+  .rx-edit { margin-top: 8px; }
+  .rx-edit textarea { width: 100%; height: 56px; background: var(--panel-2); color: var(--text);
+    border: 1px solid #2c3866; border-radius: 8px; padding: 8px; font-size: 12px; resize: vertical; font-family: inherit; }
+  .rx-edit .row { display: flex; gap: 6px; margin-top: 6px; }
+  .rx-edit .row button { flex: 1; }
+  .rx-src { font-size: 10px; color: var(--muted); }
+
+  .reps-card { display: flex; flex-direction: column; min-height: 120px; }
+  .reps-card .bars { flex: 1; display: flex; align-items: flex-end; gap: 4px; padding-top: 8px;
+    border-bottom: 1px dashed #2c3866; min-height: 70px; }
+  .reps-card .bars .bar { flex: 1; background: var(--accent); border-radius: 3px 3px 0 0; transition: height 0.2s; }
+  .reps-card .bars .bar.shallow { background: var(--warn); }
+
+  /* debrief modal */
+  .modal-bg { position: fixed; inset: 0; background: rgba(7,10,22,0.88);
+    display: none; align-items: center; justify-content: center; z-index: 50; padding: 20px; }
+  .modal-bg.show { display: flex; }
+  .modal { background: var(--panel); border-radius: 14px; width: min(680px, 95vw);
+    max-height: 92vh; overflow-y: auto; padding: 24px; }
+  .modal h2 { margin: 0 0 16px 0; font-size: 22px; color: var(--accent); }
+  .score-row { display: flex; gap: 20px; align-items: center; margin-bottom: 16px; }
+  .score-ring { width: 130px; height: 130px; border-radius: 50%; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center; position: relative;
+    background: conic-gradient(var(--ring,var(--good)) var(--pct,0%), var(--panel-2) 0); }
+  .score-ring .inner { width: 104px; height: 104px; border-radius: 50%; background: var(--panel);
+    display: flex; flex-direction: column; align-items: center; justify-content: center; }
+  .score-ring .num { font-size: 40px; font-weight: 800; line-height: 1; }
+  .score-ring .grade { font-size: 13px; color: var(--muted); }
+  .score-head { flex: 1; }
+  .score-head .headline { font-size: 16px; font-weight: 600; margin-bottom: 10px; }
+  .components { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .comp { background: var(--panel-2); border-radius: 8px; padding: 8px 10px; }
+  .comp .label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; display: flex; justify-content: space-between; }
+  .comp .meter { height: 5px; border-radius: 3px; background: #2c3866; margin-top: 5px; overflow: hidden; }
+  .comp .meter .m { height: 100%; background: var(--accent); border-radius: 3px; }
+
+  .debrief-box { background: var(--panel-2); border-radius: 10px; padding: 16px; margin: 16px 0;
+    font-size: 15px; line-height: 1.5; position: relative; }
+  .debrief-box .tag { position: absolute; top: 10px; right: 12px; font-size: 9px;
+    letter-spacing: 1px; color: var(--muted); text-transform: uppercase; }
+  .debrief-box.ai { border: 1px solid var(--accent); }
+  .speaking { display: inline-flex; align-items: center; gap: 5px; color: var(--accent); font-size: 11px; }
+  .modal .actions { display: flex; gap: 8px; margin-top: 8px; }
+  .modal .actions button { flex: 1; }
+  .report-text { white-space: pre-wrap; font-size: 14px; line-height: 1.55; }
+
+  /* toast */
+  .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+    background: var(--panel-2); border: 1px solid var(--accent); color: var(--text);
+    padding: 10px 18px; border-radius: 999px; font-size: 14px; opacity: 0;
+    transition: opacity 0.2s; z-index: 60; pointer-events: none; }
+  .toast.show { opacity: 1; }
+  .hint-help { font-size: 11px; color: var(--muted); margin-top: 8px; line-height: 1.5; }
+  kbd { background: var(--panel-2); border: 1px solid #2c3866; border-radius: 4px; padding: 1px 5px; font-size: 11px; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>
+      <span class="dot" id="conn"></span>
+      PhysioFusion <span style="color: var(--muted); font-weight: 400;">— PT Assistant</span>
+    </h1>
+    <div class="right">
+      <div class="chips">
+        <span class="chip" id="chip-gemini">Gemini</span>
+        <span class="chip" id="chip-tts">Voice</span>
+        <span class="chip" id="chip-bq">BigQuery</span>
+        <span class="chip" id="chip-mic">Mic</span>
+      </div>
+      <button id="btn-start" class="good">▶ Start set</button>
+      <button id="btn-end">■ End set</button>
+      <button id="btn-endsession">End session</button>
+    </div>
+  </header>
+
+  <section class="stage">
+    <img id="feed" alt="Live feed" />
+    <div class="no-feed" id="no-feed">Waiting for camera…</div>
+    <div class="setup-banner info" id="setup-banner">Setting up…</div>
+    <div class="overlay-flag" id="overlay-flag"></div>
+    <div class="gesture-pill" id="gesture-pill"><span class="gesture-ring" id="gesture-ring"></span>👍 thumbs up</div>
+    <div class="center-overlay hidden" id="center-overlay">
+      <div class="thumb-hint" id="co-emoji">👍</div>
+      <div class="big" id="co-title">Get into position</div>
+      <div class="sub" id="co-sub"></div>
+      <div class="countdown-num" id="co-count" style="display:none">3</div>
+      <button class="good" id="co-start">▶ Start set</button>
+    </div>
+  </section>
+
+  <aside class="sidebar">
+    <div class="card source">
+      <div class="badge camera" id="src-cam">CAMERA</div>
+      <div class="arrow">⇄</div>
+      <div class="badge imu" id="src-imu">IMU</div>
+    </div>
+
+    <div class="card">
+      <h2>Prescription <span class="rx-src" id="rx-src">default</span></h2>
+      <div id="rx-body"></div>
+      <div class="rx-edit">
+        <textarea id="rx-text" placeholder="PT: paste a prescription — e.g. '3 sets of 5 squats at 110 degrees, slow tempo, no valgus collapse, patient Jordan'"></textarea>
+        <div class="row">
+          <button id="rx-upload" class="primary">Upload prescription</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Reps</h2>
+      <div class="counter">
+        <span class="num" id="rep-count">0</span>
+        <span class="of">/ <span id="rep-target">8</span></span>
+        <span class="phase" id="phase">WAITING</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Knee angle &amp; depth</h2>
+      <div class="gauge">
+        <div class="fill" id="gauge-fill"></div>
+        <div class="target" id="gauge-target"></div>
+      </div>
+      <div class="gauge-row">
+        <span><span id="angle">—</span>°</span>
+        <span>target <span id="target-deg">—</span>° · ROM <span id="rom-min">—</span>–<span id="rom-max">—</span>°</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Signal quality</h2>
+      <div class="stats">
+        <div class="stat"><div class="label">Tempo</div><div class="value"><span id="tempo">—</span>s</div></div>
+        <div class="stat"><div class="label">Cam visibility</div><div class="value"><span id="vis">—</span></div></div>
+        <div class="stat"><div class="label">IMU quality</div><div class="value"><span id="imuq">—</span></div></div>
+        <div class="stat"><div class="label">Depth state</div><div class="value" style="font-size:13px"><span id="depth-state">—</span></div></div>
+      </div>
+    </div>
+
+    <div class="card reps-card">
+      <h2>Per-rep depth</h2>
+      <div class="bars" id="bars"></div>
+    </div>
+  </aside>
+
+  <!-- Debrief modal -->
+  <div class="modal-bg" id="debrief-bg">
+    <div class="modal">
+      <h2>Set debrief</h2>
+      <div class="score-row">
+        <div class="score-ring" id="score-ring">
+          <div class="inner"><div class="num" id="score-num">—</div><div class="grade" id="score-grade"></div></div>
+        </div>
+        <div class="score-head">
+          <div class="headline" id="score-headline"></div>
+          <div class="components" id="components"></div>
+        </div>
+      </div>
+      <div class="debrief-box" id="debrief-box">
+        <span class="tag" id="debrief-tag">Instant summary</span>
+        <span id="debrief-text"></span>
+      </div>
+      <div class="actions">
+        <button id="btn-next" class="good">👍 Next set</button>
+        <button id="btn-close">Close</button>
+        <button id="btn-endsession-2">End session &amp; report</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Session report modal -->
+  <div class="modal-bg" id="report-bg">
+    <div class="modal">
+      <h2>Session report</h2>
+      <div id="report-summary" class="components" style="margin-bottom:16px"></div>
+      <div class="debrief-box ai"><span class="tag">Clinician note (Gemini)</span><div class="report-text" id="report-text"></div></div>
+      <div class="actions"><button id="report-close" class="primary">Done</button></div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+<script>
+(() => {
+  const el = id => document.getElementById(id);
+  const feed = el("feed"), noFeed = el("no-feed"), conn = el("conn");
+  const srcCam = el("src-cam"), srcImu = el("src-imu");
+  const repCount = el("rep-count"), repTarget = el("rep-target"), phaseEl = el("phase");
+  const angleEl = el("angle"), romMin = el("rom-min"), romMax = el("rom-max"), targetDeg = el("target-deg");
+  const gaugeFill = el("gauge-fill"), gaugeTarget = el("gauge-target");
+  const tempoEl = el("tempo"), visEl = el("vis"), imuqEl = el("imuq"), depthEl = el("depth-state");
+  const barsEl = el("bars"), overlayFlag = el("overlay-flag");
+  const setupBanner = el("setup-banner");
+  const centerOverlay = el("center-overlay"), coTitle = el("co-title"), coSub = el("co-sub"),
+        coCount = el("co-count"), coStart = el("co-start"), coEmoji = el("co-emoji");
+  const gesturePill = el("gesture-pill"), gestureRing = el("gesture-ring");
+
+  // Depth gauge config; target comes from the active profile.
+  const A_MIN = 60, A_MAX = 180;
+  let targetDepth = 95, repTargetVal = 8;
+  function setAngle(a) {
+    const t = Math.max(0, Math.min(1, (A_MAX - a) / (A_MAX - A_MIN)));
+    gaugeFill.style.width = (t * 100) + "%";
+  }
+  function placeTarget() {
+    const t = (A_MAX - targetDepth) / (A_MAX - A_MIN);
+    gaugeTarget.style.left = (t * 100) + "%";
+    targetDeg.textContent = targetDepth.toFixed(0);
+  }
+
+  // ---- Feature flags (fetched once) ----
+  let flags = { gemini_available:false, tts_available:false, bq_available:false };
+  fetch("/session").then(r=>r.json()).then(d=>{
+    flags = d;
+    el("chip-gemini").className = "chip " + (d.gemini_available?"on":"off");
+    el("chip-tts").className = "chip " + (d.tts_available?"on":"off");
+    el("chip-tts").textContent = d.tts_available ? "Voice·EL" : "Voice·browser";
+    el("chip-bq").className = "chip " + (d.bq_available?"on":"off");
+  }).catch(()=>{});
+
+  // ---- Toast ----
+  let toastTimer = null;
+  function toast(msg) {
+    const t = el("toast"); t.textContent = msg; t.classList.add("show");
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(()=>t.classList.remove("show"), 1800);
+  }
+
+  // ---- Speech (browser TTS + ElevenLabs via /tts) ----
+  // agentSpeaking gates the recognizer so it never transcribes our own voice.
+  let currentAudio = null, agentSpeaking = false, speakDoneTimer = null;
+  function markSpeaking(on) {
+    agentSpeaking = on;
+    if (on && speakDoneTimer) { clearTimeout(speakDoneTimer); speakDoneTimer = null; }
+  }
+  function speakingDone() {
+    if (speakDoneTimer) clearTimeout(speakDoneTimer);
+    speakDoneTimer = setTimeout(() => { agentSpeaking = false; }, 500);
+  }
+  function stopSpeech() {
+    try { speechSynthesis.cancel(); } catch(e){}
+    if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+    speakingDone();
+  }
+  function speak(text, { preferBackend=false } = {}) {
+    if (!text) return;
+    if (preferBackend && flags.tts_available) {
+      fetch("/tts", {method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({text})})
+        .then(r => { if (!r.ok) throw new Error("tts "+r.status); return r.blob(); })
+        .then(blob => {
+          stopSpeech(); markSpeaking(true);
+          currentAudio = new Audio(URL.createObjectURL(blob));
+          currentAudio.onended = speakingDone; currentAudio.onerror = speakingDone;
+          currentAudio.play();
+        })
+        .catch(() => browserSpeak(text));
+    } else {
+      browserSpeak(text);
+    }
+  }
+  function browserSpeak(text) {
+    try {
+      stopSpeech();
+      const u = new SpeechSynthesisUtterance(text);
+      u.rate = 1.0; u.pitch = 1.0;
+      markSpeaking(true);
+      u.onend = speakingDone; u.onerror = speakingDone;
+      speechSynthesis.speak(u);
+    } catch(e){}
+  }
+
+  // ---- WebSocket ----
+  let ws = null, reconnectMs = 500;
+  window.latestState = null;
+  function send(obj){ if (ws && ws.readyState===1) ws.send(JSON.stringify(obj)); }
+  function connect() {
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    ws = new WebSocket(`${proto}://${location.host}/ws`);
+    ws.onopen = () => { conn.classList.add("connected"); reconnectMs = 500; };
+    ws.onclose = () => { conn.classList.remove("connected"); setTimeout(connect, reconnectMs); reconnectMs = Math.min(reconnectMs*2, 4000); };
+    ws.onmessage = ev => {
+      let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+      if (msg.type === "frame") onFrame(msg.jpeg);
+      else if (msg.type === "state") onState(msg.state);
+      else if (msg.type === "profile") onProfile(msg);
+      else if (msg.type === "set_end") onSetEnd(msg.summary);
+      else if (msg.type === "ai_debrief") onAiDebrief(msg);
+      else if (msg.type === "agent_reply") onAgentReply(msg);
+    };
+  }
+  function onFrame(b64) { if (noFeed) noFeed.style.display = "none"; feed.src = "data:image/jpeg;base64," + b64; }
+
+  // ---- Profile / prescription ----
+  function onProfile(m) {
+    const p = m.profile || {};
+    el("rx-src").textContent = m.source || p.source || "default";
+    targetDepth = p.depth_deg || targetDepth;
+    repTargetVal = p.reps_per_set || repTargetVal;
+    repTarget.textContent = repTargetVal;
+    placeTarget();
+    const tags = (p.contraindications||[]).map(c=>`<span class="rx-tag">${c}</span>`).join("");
+    el("rx-body").innerHTML = `
+      <div class="rx-line"><span class="k">Patient:</span> <b>${p.patient_name||"—"}</b></div>
+      ${p.condition?`<div class="rx-line"><span class="k">Condition:</span> ${p.condition}</div>`:""}
+      <div class="rx-line"><span class="k">Prescription:</span> <b>${p.sets||"?"} × ${p.reps_per_set||"?"}</b> squats @ <b>${(p.depth_deg||0).toFixed(0)}°</b>, tempo ${(p.tempo_sec||0).toFixed(1)}s</div>
+      ${p.focus?`<div class="rx-line"><span class="k">Focus:</span> ${p.focus}</div>`:""}
+      ${tags?`<div class="rx-tags">${tags}</div>`:""}`;
+  }
+
+  // ---- Live state ----
+  let flagTimer = null, lastSpokenSetupCode = null, lastCountdown = null;
+  function onState(s) {
+    window.latestState = s;
+    setAngle(s.angle); angleEl.textContent = s.angle.toFixed(1);
+    repCount.textContent = s.rep_count; repTarget.textContent = s.rep_target; repTargetVal = s.rep_target;
+    phaseEl.textContent = (s.phase||"").replace(/_/g," ");
+    romMin.textContent = s.rom_min.toFixed(0); romMax.textContent = s.rom_max.toFixed(0);
+    tempoEl.textContent = s.tempo > 0 ? s.tempo.toFixed(1) : "—";
+    visEl.textContent = s.landmark_visibility.toFixed(2);
+    imuqEl.textContent = s.imu_quality.toFixed(2);
+    depthEl.textContent = (s.depth_state||"—").replace("_"," ");
+    if (s.profile && s.profile.depth_deg) { targetDepth = s.profile.depth_deg; placeTarget(); }
+
+    const cam = s.tracking_source === "camera";
+    srcCam.classList.toggle("active", cam);
+    srcImu.classList.toggle("active", s.tracking_source === "imu");
+
+    // setup banner
+    const su = s.setup_status || {};
+    setupBanner.className = "setup-banner " + (su.severity||"info");
+    setupBanner.textContent = su.hint || "";
+    setupBanner.style.display = (s.phase === "SET_ACTIVE" && su.code === "ok") ? "none" : "flex";
+
+    // gesture pill
+    gesturePill.classList.toggle("show", !!s.gesture || (s.thumb_progress||0) > 0.05);
+    gestureRing.style.setProperty("--p", Math.round((s.thumb_progress||0)*100) + "%");
+
+    // phase-driven center overlay
+    updatePhaseUI(s, su);
+
+    // form flags (visual overlay always; spoken cue only mid-set, throttled)
+    if (s.form_flags && s.form_flags.length) {
+      overlayFlag.textContent = labelForFlag(s.form_flags[0]);
+      overlayFlag.classList.add("show");
+      if (flagTimer) clearTimeout(flagTimer);
+      flagTimer = setTimeout(()=>overlayFlag.classList.remove("show"), 1500);
+      if (s.phase === "SET_ACTIVE") inSetSpeak(labelForFlag(s.form_flags[0]));
+    }
+    maybeRepCue(s);
+    renderBars(s.rep_depths || []);
+
+    // start/end button enablement
+    el("btn-start").disabled = !(s.phase === "WAITING_FOR_START" || s.phase === "DEBRIEF" || s.phase === "SET_END");
+    el("btn-end").disabled = s.phase !== "SET_ACTIVE";
+  }
+
+  function updatePhaseUI(s, su) {
+    const phase = s.phase;
+    if (phase === "WAITING_FOR_START") {
+      centerOverlay.classList.remove("hidden");
+      coEmoji.style.display = ""; coCount.style.display = "none"; coStart.style.display = "";
+      const ready = su.code === "ok";
+      coEmoji.textContent = ready ? "🎙️" : "🧍";
+      coTitle.textContent = ready ? "Ready when you are" : "Get into position";
+      coSub.textContent = ready
+        ? "Say “hey coach, I’m ready” (or hold space to talk), or click Start."
+        : (su.hint || "Stand sideways to the camera, full body in frame.");
+      // speak setup guidance when it changes
+      if (su.code && su.code !== lastSpokenSetupCode) {
+        lastSpokenSetupCode = su.code;
+        if (su.hint) browserSpeak(su.hint);
+      }
+    } else if (phase === "COUNTDOWN") {
+      centerOverlay.classList.remove("hidden");
+      coEmoji.style.display = "none"; coStart.style.display = "none"; coCount.style.display = "";
+      coTitle.textContent = "Get ready";
+      coSub.textContent = "";
+      const c = s.countdown;
+      coCount.textContent = (c && c > 0) ? c : "GO";
+      if (c !== lastCountdown) { lastCountdown = c; if (c > 0) browserSpeak(String(c)); }
+    } else {
+      centerOverlay.classList.add("hidden");
+      lastSpokenSetupCode = null; lastCountdown = null;
+    }
+  }
+
+  function labelForFlag(f) {
+    if (f === "shallow") return "Go deeper";
+    if (f === "too_fast") return "Slow it down";
+    return f.replace("_"," ");
+  }
+
+  // ---- In-set hardcoded cues (fast, local — no LLM lag while squatting) ----
+  let lastInSetSpeakAt = 0, lastRepCount = 0;
+  const PRAISE = ["Great job", "Nice and controlled", "Strong rep", "Perfect", "Looking good", "That's it"];
+  function inSetSpeak(text) {
+    const now = Date.now();
+    if (now - lastInSetSpeakAt < 2800) return;   // don't pile cues on top of each other
+    lastInSetSpeakAt = now; browserSpeak(text);
+  }
+  function maybeRepCue(s) {
+    if (s.phase !== "SET_ACTIVE") { lastRepCount = s.rep_count; return; }
+    if (s.rep_count > lastRepCount) {
+      lastRepCount = s.rep_count;
+      if (s.rep_count >= s.rep_target) return;            // debrief speaks instead
+      if (s.rep_target - s.rep_count === 1) { inSetSpeak("Last one!"); return; }
+      const depths = s.rep_depths || [];
+      const good = depths.length ? depths[depths.length-1] <= targetDepth + 5 : true;
+      if (good && s.rep_count % 2 === 0) inSetSpeak(PRAISE[s.rep_count % PRAISE.length]);
+      // shallow reps are covered by the spoken form-flag ("Go deeper")
+    } else if (s.rep_count < lastRepCount) {
+      lastRepCount = s.rep_count;                          // new set started
+    }
+  }
+  function renderBars(depths) {
+    if (depths.length === barsEl.childElementCount && depths.length>0) return;
+    barsEl.innerHTML = "";
+    if (!depths.length) return;
+    const minA = Math.min(...depths, targetDepth) - 5, maxA = 180;
+    for (const d of depths) {
+      const t = Math.max(0.05, Math.min(1, (maxA - d) / (maxA - minA)));
+      const bar = document.createElement("div");
+      bar.className = "bar" + (d > targetDepth + 5 ? " shallow" : "");
+      bar.style.height = (t*100) + "%"; bar.title = `${d.toFixed(0)}°`;
+      barsEl.appendChild(bar);
+    }
+  }
+
+  // ---- Set end / score / debrief ----
+  let currentSummarySeq = 0;
+  function ringColor(v){ return v>=80?"var(--good)":v>=60?"var(--warn)":"var(--bad)"; }
+  function onSetEnd(summary) {
+    currentSummarySeq++;
+    const sc = summary.score || {overall: summary.set_score||0, grade:"—", components:{}, headline:""};
+    const ring = el("score-ring");
+    ring.style.setProperty("--pct", sc.overall + "%");
+    ring.style.setProperty("--ring", ringColor(sc.overall));
+    el("score-num").textContent = sc.overall;
+    el("score-grade").textContent = "Grade " + (sc.grade||"—");
+    el("score-headline").textContent = sc.headline || "";
+    const comps = sc.components || {};
+    el("components").innerHTML = Object.entries(comps).map(([k,v])=>`
+      <div class="comp"><div class="label"><span>${k}</span><span>${v}</span></div>
+      <div class="meter"><div class="m" style="width:${v}%;background:${ringColor(v)}"></div></div></div>`).join("");
+    // debrief: templated first
+    el("debrief-tag").textContent = "Instant summary";
+    el("debrief-box").className = "debrief-box";
+    el("debrief-text").textContent = summary.templated_debrief || "";
+    el("debrief-bg").classList.add("show");
+    // speak the instant summary now (browser), AI will replace if it arrives
+    speak(summary.templated_debrief, {preferBackend:false});
+  }
+  function onAiDebrief(m) {
+    // swap in the richer Gemini debrief and speak it (ElevenLabs if available)
+    if (!el("debrief-bg").classList.contains("show")) return;
+    el("debrief-tag").innerHTML = '<span class="speaking">🔊 PT coach (Gemini)</span>';
+    el("debrief-box").className = "debrief-box ai";
+    el("debrief-text").textContent = m.text || "";
+    speak(m.text, {preferBackend:true});
+  }
+
+  // ---- Session report ----
+  function showReport(d) {
+    el("debrief-bg").classList.remove("show");
+    el("report-summary").innerHTML = `
+      <div class="comp"><div class="label">Sets</div><div style="font-size:20px;font-weight:700">${d.sets_count||0}</div></div>
+      <div class="comp"><div class="label">Total reps</div><div style="font-size:20px;font-weight:700">${d.total_reps||0}</div></div>
+      <div class="comp"><div class="label">Avg depth</div><div style="font-size:20px;font-weight:700">${d.avg_depth!=null?d.avg_depth+"°":"—"}</div></div>
+      <div class="comp"><div class="label">Adherence</div><div style="font-size:16px;font-weight:700">${d.adherence_flag||"—"}</div></div>`;
+    el("report-text").textContent = d.report || (d.reason ? "No report — "+d.reason : "No report available (Gemini disabled or no sets).");
+    el("report-bg").classList.add("show");
+    if (d.report) speak(d.report, {preferBackend:true});
+  }
+  function endSession() {
+    toast("Ending session…");
+    fetch("/session/end", {method:"POST"}).then(r=>r.json()).then(showReport).catch(()=>toast("Session end failed"));
+  }
+
+  // ---- Prescription upload ----
+  el("rx-upload").onclick = () => {
+    const text = el("rx-text").value.trim();
+    if (!text) { toast("Enter a prescription first"); return; }
+    el("rx-upload").disabled = true; el("rx-upload").textContent = "Parsing…";
+    fetch("/profile/upload", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({text})})
+      .then(r => r.ok ? r.json() : r.json().then(e=>Promise.reject(e)))
+      .then(d => { toast("Prescription applied: "+(d.profile.patient_name||"")); el("rx-text").value=""; })
+      .catch(e => toast((e && e.detail) ? e.detail : "Parse failed — check Gemini key"))
+      .finally(()=>{ el("rx-upload").disabled=false; el("rx-upload").textContent="Upload prescription"; });
+  };
+
+  // ---- Buttons ----
+  el("btn-start").onclick = () => { send({cmd:"start_set"}); toast("Start set"); };
+  coStart.onclick = () => { send({cmd:"start_set"}); toast("Start set"); };
+  el("btn-end").onclick = () => { send({cmd:"end_set"}); toast("End set"); };
+  el("btn-next").onclick = () => { send({cmd:"reset_set"}); el("debrief-bg").classList.remove("show"); stopSpeech(); };
+  el("btn-close").onclick = () => { el("debrief-bg").classList.remove("show"); stopSpeech(); };
+  el("btn-endsession").onclick = endSession;
+  el("btn-endsession-2").onclick = endSession;
+  el("report-close").onclick = () => { el("report-bg").classList.remove("show"); stopSpeech(); };
+
+  // ---- Conversational voice agent ----
+  // The browser does speech-to-text (Web Speech); finalized utterances go to the
+  // backend agent (Gemini), which replies and may act (start/end/next set, end
+  // session). MID-SET we stay local — fast hardcoded cues + a "done" keyword —
+  // so there's no LLM lag while the patient is moving.
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  let recog = null, recogRunning = false, recogWantOn = false;
+  let convoUntil = 0;
+  const WAKE = "hey coach";
+  const END_WORDS = /\b(done|stop|finish|finished|that'?s it|end set|i'?m done|enough)\b/;
+
+  function openConvo(ms=10000){ convoUntil = Date.now() + ms; }
+  function sendToAgent(text){ if (!text) return; send({cmd:"say", text}); openConvo(); toast("🎙 "+text); }
+
+  function handleUtterance(raw){
+    const t = (raw||"").toLowerCase().trim();
+    if (!t || agentSpeaking) return;
+    const phase = (window.latestState||{}).phase;
+    if (phase === "SET_ACTIVE") {                 // local only mid-set
+      if (END_WORDS.test(t)) { send({cmd:"end_set"}); toast("■ End set"); }
+      return;
+    }
+    if (t.includes(WAKE)) {                        // wake word
+      const after = t.split(WAKE).pop().trim();
+      openConvo();
+      if (after.length > 1) sendToAgent(after); else toast("🎙 Listening…");
+      return;
+    }
+    if (Date.now() < convoUntil) sendToAgent(t);   // open follow-up window
+  }
+
+  function onAgentReply(m){
+    if (m.text) speak(m.text, {preferBackend:true});
+    if (m.action && m.action !== "none") toast("→ " + m.action.replace("_"," "));
+    if (m.report) showReport(m.report);
+    openConvo();                                   // keep it open for natural follow-ups
+  }
+
+  function startRecog(){ if (!recog || recogRunning) return; recogWantOn = true; try { recog.start(); } catch(e){} }
+  if (SR) {
+    recog = new SR(); recog.continuous = true; recog.interimResults = true; recog.lang = "en-US";
+    recog.onstart = () => { recogRunning = true; el("chip-mic").className="chip on"; el("chip-mic").textContent="Mic·on"; };
+    recog.onresult = e => { const r = e.results[e.results.length-1]; if (r && r.isFinal && r[0]) handleUtterance(r[0].transcript); };
+    recog.onerror = ev => {
+      if (ev.error === "not-allowed" || ev.error === "service-not-allowed") {
+        recogWantOn = false; el("chip-mic").className="chip off"; el("chip-mic").textContent="Mic·blocked";
+      }
+    };
+    recog.onend = () => { recogRunning = false; if (recogWantOn) setTimeout(startRecog, 300); };
+    el("chip-mic").className="chip"; el("chip-mic").textContent="Mic·click page";
+    startRecog();
+    const kick = () => startRecog();
+    document.addEventListener("click", kick);
+    document.addEventListener("keydown", kick);
+  } else { el("chip-mic").className="chip off"; el("chip-mic").textContent="No mic"; }
+
+  // Push-to-talk: hold space to open a conversation window without the wake word.
+  window.addEventListener("keydown", e => {
+    if (e.target.tagName === "TEXTAREA") return;
+    if (e.code === "Space" && !e.repeat) { e.preventDefault(); openConvo(6000); toast("🎙 Listening…"); }
+  });
+
+  placeTarget();
+  connect();
+})();
+</script>
+</body>
+</html>

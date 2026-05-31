@@ -14,6 +14,11 @@ __pycache__/
 .idea/
 .vscode/
 
+# Frontend (React/Vite). node_modules is huge + regenerable; dist is the build
+# (we build into static/, which IS committed so the server can serve it).
+frontend/node_modules/
+frontend/dist/
+
 # Claude Code internals
 .claude/
 .conductor/
