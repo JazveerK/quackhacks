@@ -1,0 +1,10 @@
+# Slim runtime deps for the PF_DEMO cloud deploy (Cloud Run / Render).
+# Deliberately OMITS mediapipe / opencv-python / numpy: demo mode never imports
+# pose_tracker, so the public link runs without the heavy CV stack or a webcam.
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+google-generativeai>=0.7.0
+google-cloud-bigquery>=3.0
+python-dotenv>=1.0
+pypdf>=4.0
+python-multipart>=0.0.9

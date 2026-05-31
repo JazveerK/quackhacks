@@ -39,7 +39,12 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from pose_tracker import PoseTracker, MockIMU
+# Camera-less demo mode (PF_DEMO) for cloud hosting: skip the real PoseTracker
+# entirely so the deployed image never needs OpenCV / MediaPipe / a webcam. The
+# heavy `from pose_tracker import ...` is therefore done lazily inside
+# _start_tracker() only on the real (non-demo) path.
+DEMO_MODE = os.environ.get("PF_DEMO", "").strip().lower() not in ("", "0", "false", "no")
+
 from profile import PTProfile, DEFAULT_PROFILE
 import ai_agent
 import bq
@@ -267,6 +272,24 @@ def _select_camera_index() -> int:
 
 def _start_tracker() -> None:
     global tracker, tracker_thread
+    if DEMO_MODE:
+        from demo_tracker import DemoTracker
+        print("[server] PF_DEMO set -> camera-less DemoTracker (synthetic set stream).")
+        tracker = DemoTracker(
+            on_state=bridge.push_state,
+            on_set_end=_on_set_end,
+            on_ai_debrief=bridge.push_ai_debrief,
+            on_profile_change=bridge.push_profile,
+        )
+        bridge.push_profile(tracker.profile, source=getattr(tracker.profile, "source", "demo"))
+        tracker_thread = threading.Thread(
+            target=tracker.run, daemon=True, name="demo-tracker")
+        tracker_thread.start()
+        return
+
+    # Real camera path — import the heavy pose core only now.
+    from pose_tracker import PoseTracker, MockIMU  # noqa: F401 (MockIMU used by _make_imu_source)
+    globals()["MockIMU"] = MockIMU
     camera_index = _select_camera_index()
     tracker = PoseTracker(
         imu_source=_make_imu_source(),

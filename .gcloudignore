@@ -1,0 +1,9 @@
+# Keep the Cloud Build upload small. (gcloud uses this instead of .gitignore.)
+.venv
+venv
+**/__pycache__
+*.pyc
+.git
+frontend/node_modules
+frontend/dist
+imu_diag

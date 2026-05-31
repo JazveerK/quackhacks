@@ -1,0 +1,28 @@
+# Keep the build context small + the demo image lean.
+.venv
+venv
+__pycache__
+**/__pycache__
+*.pyc
+.git
+.gitignore
+
+# Frontend source isn't needed at runtime — the built bundle lives in static/.
+frontend/node_modules
+frontend/src
+frontend/public
+frontend/dist
+frontend/node_modules/**
+
+# Heavy CV deps never used in demo mode.
+requirements.txt
+
+# Local-only / hardware / docs.
+.venv/**
+tests
+imu_diag
+imu_diag.ino
+imu_firmware.ino
+*.md
+probe_ws.py
+run.py
