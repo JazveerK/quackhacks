@@ -27,7 +27,7 @@ from profile import PTProfile, DEFAULT_PROFILE
 
 
 GEMINI_MODEL = "gemini-2.5-flash"
-DEBRIEF_CHAR_CAP = 600              # ~15-20s of ElevenLabs speech, plenty
+DEBRIEF_CHAR_CAP = 850              # ~25s of spoken debrief (4-6 sentences)
 MAX_PARSE_INPUT_CHARS = 4000        # cap the prescription text we send
 
 # ---------------------------------------------------------------------------
@@ -59,24 +59,34 @@ TEXT:
 """
 
 
-_DEBRIEF_PROMPT_TEMPLATE = """You are a supportive physical therapy exercise coach.
-You do NOT diagnose conditions or prescribe medical treatment.
-You coach form and range of motion based on what the sensors saw.
+_DEBRIEF_PROMPT_TEMPLATE = """You are a knowledgeable, supportive physical-therapy exercise coach
+giving a patient real-time spoken feedback right after they finish a set of squats.
+You do NOT diagnose conditions or prescribe medical treatment. You coach form,
+depth, tempo, and consistency based strictly on what the sensors measured.
 
-The patient is described in the PROFILE block. If a patient_name is set, address them by it.
-If a condition is set, you may reference it briefly (do not over-emphasise).
-If contraindications are listed, mention only if the data suggests the patient came close to violating one.
+The patient is described in the PROFILE block. If a patient_name is set, address
+them by it. If a condition is set, you may reference it briefly (don't over-emphasise).
+If contraindications are listed, mention one ONLY if the data suggests they came
+close to violating it.
 
-Reference SPECIFIC numbers from the SUMMARY block. Useful fields:
+This set earned a SET SCORE out of 100 (in SUMMARY.set_score, with a letter grade
+and per-component breakdown in SUMMARY.score). Open by acknowledging the score in
+plain language ("that's a solid 84" / "82 — good work"), then explain WHAT drove it.
+
+Ground every claim in SPECIFIC numbers from the SUMMARY. Useful fields:
+- set_score, score.components (depth / consistency / tempo / completion)
 - analysis.depth.target_hit_rate, mean_deg, halves_delta_deg, trend
-- analysis.tempo.eccentric_concentric_ratio_mean, trend, halves_delta_sec
+- analysis.tempo.eccentric_concentric_ratio_mean, trend, mean_sec
 - analysis.form.shallow_rep_indices, fast_rep_indices
-- analysis.tracking.camera_frame_ratio
-- voided_reps
+- analysis.rom.min_deg/max_deg, voided_reps, fatigue_signal
 
-Return a 3-5 sentence SPOKEN debrief in warm, plain-language PT vocabulary.
-End with ONE concrete next-set adjustment (reps / depth / tempo).
-NO markdown, NO bullet points, NO headings. One short paragraph.
+Structure (still ONE flowing spoken paragraph, NOT a list):
+1. The score + the single biggest thing that went well.
+2. The single most useful thing to improve, tied to a specific number or rep.
+3. ONE concrete, actionable next-set adjustment (reps / depth / tempo).
+
+Warm, encouraging, plain-language PT vocabulary. 4-6 sentences.
+NO markdown, NO bullet points, NO headings, NO emoji. It will be read ALOUD.
 
 PROFILE:
 {profile_json}
@@ -160,7 +170,8 @@ _SESSION_REPORT_PROMPT_TEMPLATE = """You are a physical therapist writing a brie
 Audience is the CLINICIAN at the next visit, NOT the patient. No medical advice.
 
 From the patient's profile and the sequence of completed sets below, give:
-- A 2-4 sentence summary of how the session went.
+- A 2-4 sentence summary of how the session went, citing the per-set scores
+  (set_score) and how they trended across the session.
 - Adherence (did they hit the prescribed reps and depth?).
 - Depth trend across sets (improving, holding, declining).
 - Fatigue pattern (early, late, none).
@@ -195,6 +206,7 @@ def generate_session_report(profile: PTProfile, set_rows: list[dict]) -> Optiona
             tempo = analysis.get("tempo") or {}
             compact.append({
                 "set_index":         r.get("set_index"),
+                "set_score":         r.get("set_score"),
                 "reps_completed":    r.get("reps_completed", r.get("reps")),
                 "rep_target":        r.get("rep_target"),
                 "avg_depth_deg":     depth.get("mean_deg", r.get("avg_depth_deg")),
@@ -218,6 +230,100 @@ def generate_session_report(profile: PTProfile, set_rows: list[dict]) -> Optiona
     if not text:
         return None
     return text[:DEBRIEF_CHAR_CAP * 2]  # ~ paragraph
+
+
+# ---------------------------------------------------------------------------
+# Conversational voice agent.
+# ---------------------------------------------------------------------------
+AGENT_ACTIONS = {"none", "start_set", "end_set", "next_set", "end_session"}
+
+_AGENT_PROMPT = """You are PhysioFusion's voice coach — a warm, encouraging physical-therapy
+exercise assistant talking OUT LOUD with a patient during their squat session.
+You are NOT a doctor: never diagnose or prescribe medical treatment. If the patient
+mentions pain or a medical worry, respond with empathy and gently suggest they check
+with their physical therapist; do not give clinical advice.
+
+You can take ACTIONS by setting the "action" field (infer intent, don't match exact words):
+- "start_set"   : the patient is ready to begin / "let's go" / "I'm ready" / "start".
+- "end_set"     : they're done with the current set / "stop" / "that's enough".
+- "next_set"    : move on to the next set after a debrief.
+- "end_session" : finish the whole session / "I'm finished for today".
+- "none"        : just converse — answer a question, encourage, chat. No action.
+
+Only choose start_set when the phase is WAITING_FOR_START or DEBRIEF. Only choose end_set
+when phase is SET_ACTIVE. If an action doesn't fit the phase, use "none" and say why briefly.
+
+Use the CONTEXT (phase, prescription, reps, last set) to answer naturally and SPECIFICALLY
+— e.g. "how did I do" -> cite the last set's score and depth; "what's my prescription" ->
+read it back; "how many sets left" -> do the math.
+
+Return ONLY JSON: {{"speech": string, "action": one of the actions above}}.
+"speech" is SHORT and natural — one or two spoken sentences. No markdown, no lists, no emoji.
+It will be read aloud, so write how a coach would actually talk.
+
+CONTEXT (live session state):
+{context_json}
+
+CONVERSATION SO FAR (most recent last):
+{history_text}
+
+PATIENT JUST SAID:
+{user_text}
+"""
+
+
+def _converse_fallback(text: str) -> dict:
+    """Keyword-based intent so voice still controls the app when Gemini is
+    unavailable. Mirrors the action vocabulary of the LLM path."""
+    t = (text or "").lower()
+    if ("session" in t or "workout" in t) and any(w in t for w in ("end", "finish", "done", "wrap")):
+        return {"speech": "Wrapping up your session now.", "action": "end_session"}
+    if "next" in t:
+        return {"speech": "On to the next set.", "action": "next_set"}
+    if any(w in t for w in ("start", "ready", "let's go", "lets go", "begin", "go ahead")):
+        return {"speech": "Starting your set — get into position!", "action": "start_set"}
+    if any(w in t for w in ("done", "stop", "finished", "end set", "that's it", "thats it", "enough")):
+        return {"speech": "Ending the set. Nice work.", "action": "end_set"}
+    return {"speech": "", "action": "none"}
+
+
+def converse(user_text: str, context: dict, history: Optional[list] = None) -> dict:
+    """One conversational turn for the voice coach.
+
+    Returns {"speech": str, "action": <one of AGENT_ACTIONS>}. Falls back to a
+    keyword intent (still controls the app) if Gemini is unavailable or errors —
+    never raises.
+    """
+    user_text = (user_text or "").strip()
+    if not user_text:
+        return {"speech": "", "action": "none"}
+    genai = _client()
+    if genai is None:
+        return _converse_fallback(user_text)
+    try:
+        hist = history or []
+        history_text = "\n".join(
+            f"{h.get('role', 'patient')}: {h.get('text', '')}" for h in hist[-6:]
+        ) or "(none)"
+        prompt = _AGENT_PROMPT.format(
+            context_json=json.dumps(context or {}, indent=2)[:3000],
+            history_text=history_text,
+            user_text=user_text[:500],
+        )
+        model = genai.GenerativeModel(
+            GEMINI_MODEL,
+            generation_config={"response_mime_type": "application/json"},
+        )
+        response = model.generate_content(prompt)
+        data = json.loads(_strip_json_fence(response.text or "{}"))
+    except Exception as e:
+        print(f"[ai_agent] converse error: {e}")
+        return _converse_fallback(user_text)
+    action = data.get("action", "none")
+    if action not in AGENT_ACTIONS:
+        action = "none"
+    speech = (data.get("speech") or "").strip()[:DEBRIEF_CHAR_CAP]
+    return {"speech": speech, "action": action}
 
 
 def generate_debrief(profile: PTProfile, summary: dict) -> Optional[str]:

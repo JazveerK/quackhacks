@@ -584,6 +584,111 @@ def t26_session_report_no_key_is_silent():
 
 
 # ---------------------------------------------------------------------------
+# Thumbs-up gesture detection (start / end / advance trigger).
+# ---------------------------------------------------------------------------
+class _SynthHand:
+    def __init__(self, x: float, y: float) -> None:
+        self.x = x; self.y = y
+
+
+def _thumbs_up_hand() -> list:
+    """21 hand landmarks shaped like a thumbs-up (y grows downward)."""
+    from pose_tracker import HLM
+    h = [_SynthHand(0.5, 0.5) for _ in range(21)]
+    h[HLM.WRIST.value]      = _SynthHand(0.50, 0.90)
+    h[HLM.THUMB_MCP.value]  = _SynthHand(0.45, 0.60)
+    h[HLM.THUMB_IP.value]   = _SynthHand(0.44, 0.45)
+    h[HLM.THUMB_TIP.value]  = _SynthHand(0.43, 0.28)
+    # Four fingers curled: tip BELOW (larger y than) its PIP joint.
+    for pip, tip in ((HLM.INDEX_FINGER_PIP, HLM.INDEX_FINGER_TIP),
+                     (HLM.MIDDLE_FINGER_PIP, HLM.MIDDLE_FINGER_TIP),
+                     (HLM.RING_FINGER_PIP, HLM.RING_FINGER_TIP),
+                     (HLM.PINKY_PIP, HLM.PINKY_TIP)):
+        h[pip.value] = _SynthHand(0.55, 0.55)
+        h[tip.value] = _SynthHand(0.55, 0.66)
+    return h
+
+
+def _fist_hand() -> list:
+    """Closed fist — thumb also curled, so NOT a thumbs-up."""
+    h = _thumbs_up_hand()
+    from pose_tracker import HLM
+    h[HLM.THUMB_TIP.value] = _SynthHand(0.50, 0.66)   # thumb tip down
+    return h
+
+
+def t27_thumbs_up_detection():
+    print("\n[27] Thumbs-up gesture: clear thumbs-up detected, fist rejected")
+    from pose_tracker import detect_thumbs_up
+    check("thumbs-up -> True", detect_thumbs_up(_thumbs_up_hand()) is True,
+          True, detect_thumbs_up(_thumbs_up_hand()))
+    check("fist -> False", detect_thumbs_up(_fist_hand()) is False,
+          False, detect_thumbs_up(_fist_hand()))
+    check("malformed -> False", detect_thumbs_up([]) is False,
+          False, detect_thumbs_up([]))
+
+
+def t28_set_score():
+    print("\n[28] Set score: present, bounded, and a clean set beats a sloppy one")
+    from profile import PTProfile
+    p = PTProfile(reps_per_set=6, depth_deg=95.0, tempo_sec=1.5)
+
+    # Clean deep set: 6 reps at 88°, controlled tempo.
+    good = PoseTracker(show_window=False, profile=p)
+    good._set_start_t = 0.0
+    t = 0.0
+    for _ in range(6):
+        t = _drive_squat(good.counter, t, descent_s=1.2, hold_s=0.3,
+                         ascent_s=1.2, rest_s=0.4, bot=88.0)
+    good._cam_frame_count = 1000
+    gs = good._build_summary(t)
+
+    # Sloppy set: only 3 of 6 reps, all shallow at 115°.
+    bad = PoseTracker(show_window=False, profile=p)
+    bad._set_start_t = 0.0
+    t = 0.0
+    for _ in range(3):
+        t = _drive_squat(bad.counter, t, descent_s=1.2, hold_s=0.3,
+                         ascent_s=1.2, rest_s=0.4, bot=115.0)
+    bad._cam_frame_count = 1000
+    bs = bad._build_summary(t)
+
+    check("'set_score' top-level", "set_score" in gs, "present",
+          "present" if "set_score" in gs else "MISSING")
+    check("'score' block present", isinstance(gs.get("score"), dict),
+          "dict", type(gs.get("score")).__name__)
+    check("score in 0..100", 0 <= gs["set_score"] <= 100, "0..100", gs["set_score"])
+    for k in ("depth", "consistency", "tempo", "completion"):
+        check(f"component '{k}'", k in gs["score"]["components"], "present",
+              "present" if k in gs["score"]["components"] else "MISSING")
+    check("clean set scores higher than sloppy set",
+          gs["set_score"] > bs["set_score"],
+          f">{bs['set_score']}", gs["set_score"])
+
+
+def t29_voice_agent_fallback():
+    print("\n[29] Voice agent: keyword fallback maps intent; actions validated")
+    import os, ai_agent
+    saved = os.environ.pop("GEMINI_API_KEY", None)
+    try:
+        r_start = ai_agent.converse("okay coach I'm ready let's go", {"phase":"WAITING_FOR_START"})
+        r_end   = ai_agent.converse("alright I think I'm done", {"phase":"SET_ACTIVE"})
+        r_next  = ai_agent.converse("next set please", {"phase":"DEBRIEF"})
+        r_chat  = ai_agent.converse("what's the weather like", {"phase":"WAITING_FOR_START"})
+        check("'ready, let's go' -> start_set", r_start["action"]=="start_set", "start_set", r_start["action"])
+        check("'I'm done' -> end_set", r_end["action"]=="end_set", "end_set", r_end["action"])
+        check("'next set' -> next_set", r_next["action"]=="next_set", "next_set", r_next["action"])
+        check("chatter -> none", r_chat["action"]=="none", "none", r_chat["action"])
+        for r in (r_start, r_end, r_next, r_chat):
+            check("action in AGENT_ACTIONS", r["action"] in ai_agent.AGENT_ACTIONS, "valid", r["action"])
+        check("empty text -> none", ai_agent.converse("", {})["action"]=="none",
+              "none", ai_agent.converse("", {})["action"])
+    finally:
+        if saved is not None:
+            os.environ["GEMINI_API_KEY"] = saved
+
+
+# ---------------------------------------------------------------------------
 # Main.
 # ---------------------------------------------------------------------------
 def main() -> int:
@@ -604,7 +709,9 @@ def main() -> int:
                t21_ai_agent_no_key_is_silent, t22_summary_has_ai_debrief_slot,
                t23_bq_no_auth_is_silent, t24_bq_fatigue_score_mapping,
                t25_bq_next_recommendation_uses_analysis,
-               t26_session_report_no_key_is_silent):
+               t26_session_report_no_key_is_silent,
+               t27_thumbs_up_detection, t28_set_score,
+               t29_voice_agent_fallback):
         fn()
     print("=" * 72)
     passed = sum(results)

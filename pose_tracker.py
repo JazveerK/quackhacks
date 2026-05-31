@@ -50,8 +50,13 @@ MIN_REP_SEC = 0.7               # anything faster than this is noise, void it
 MAX_REP_SEC = 15.0              # anything slower than this is paused/abandoned
 STUCK_DOWN_SEC = 20.0           # stuck in 'down' this long => force reset (sat down)
 MIN_CAM_FRAC = 0.5              # rep must be >= this fraction camera-tracked to count
+COUNT_DEPTH_MARGIN_DEG = 10     # a rep only counts if it bends to within this many
+                                # degrees of "parallel" (target+buffer). Raises the
+                                # depth bar so tiny bobs near DOWN_ENTER_DEG don't count.
 STILL_ANGLE_BAND = 8            # +/- deg considered "still" at top
-STILL_SECONDS = 4.0             # standing-still this long => end set
+STILL_SECONDS = 20.0            # standing-still this long => auto-end (idle fallback).
+                                # Primary set-end is a thumbs-up / voice / button;
+                                # this only catches "patient walked away" cases.
 FLAG_TTL_SEC = 2.5              # how long a form flag stays visible per-frame
 VIS_THRESHOLD = 0.6             # avg leg-landmark visibility for camera-trusted
 LANDMARK_VIS_FLOOR = 0.4        # every leg landmark must clear this
@@ -62,6 +67,18 @@ STALE_FRAME_SEC = 2.0           # seconds without a fresh camera frame -> error
 DEBOUNCE_FRAMES = 3             # consecutive frames past threshold to flip phase
 ANGLE_EMA_ALPHA = 0.30          # EMA smoothing for angle (0..1, higher = snappier)
 
+# Set-lifecycle + gesture control.
+#
+# The set no longer auto-starts: the patient gets into position (guided by
+# setup_status), then a thumbs-up (or voice / button) starts a 3-2-1 countdown
+# into SET_ACTIVE. A thumbs-up held during the set ends it; during DEBRIEF it
+# advances to the next set. Gestures are confirmed over consecutive frames with
+# a cooldown so a stray frame can't fire them.
+COUNTDOWN_SEC = 3.0             # 3-2-1 countdown after the start trigger
+GESTURE_CONFIRM_FRAMES = 6      # consecutive thumbs-up frames to START / advance
+END_GESTURE_CONFIRM_FRAMES = 14 # stricter hold to END a live set (avoid accidents)
+GESTURE_COOLDOWN_SEC = 2.0      # ignore repeat gestures within this window
+
 # MediaPipe drawing styles. Cyan dots, lighter blue connections for visibility.
 import mediapipe.python.solutions.drawing_utils as _du
 _LANDMARK_STYLE = _du.DrawingSpec(color=(180, 255, 0), thickness=3, circle_radius=4)
@@ -71,6 +88,10 @@ _CONNECTION_STYLE = _du.DrawingSpec(color=(255, 200, 80), thickness=2)
 mp_pose = mp.solutions.pose
 mp_draw = mp.solutions.drawing_utils
 LM = mp_pose.PoseLandmark
+
+# MediaPipe Hands — used only for the thumbs-up start/end/advance gesture.
+mp_hands = mp.solutions.hands
+HLM = mp_hands.HandLandmark
 
 LEFT_HIP, LEFT_KNEE, LEFT_ANKLE = LM.LEFT_HIP.value, LM.LEFT_KNEE.value, LM.LEFT_ANKLE.value
 RIGHT_HIP, RIGHT_KNEE, RIGHT_ANKLE = LM.RIGHT_HIP.value, LM.RIGHT_KNEE.value, LM.RIGHT_ANKLE.value
@@ -124,6 +145,50 @@ def imu_tilt_to_knee_angle(tilt_deg: float) -> float:
     return max(60.0, min(180.0, 180.0 - tilt_deg))
 
 
+def detect_thumbs_up(landmarks) -> bool:
+    """Heuristic thumbs-up from a single hand's 21 normalized landmarks.
+
+    `landmarks` is a sequence indexable by HandLandmark value, each with
+    `.x`/`.y` in [0,1] (image coords; y grows downward). Orientation-agnostic
+    for left/right hands and mirror flips:
+
+    - Thumb is extended roughly vertically (tip clearly above the MCP), and
+    - the other four fingers are curled (each tip below — larger y than — its
+      PIP joint), for at least 3 of 4 fingers.
+
+    Returns False on any malformed input.
+    """
+    try:
+        def y(i): return landmarks[i].y
+        def x(i): return landmarks[i].x
+
+        thumb_tip, thumb_ip, thumb_mcp = HLM.THUMB_TIP, HLM.THUMB_IP, HLM.THUMB_MCP
+        wrist = HLM.WRIST
+
+        # Thumb pointing up: tip above the IP above the MCP, and tip well above
+        # the wrist (at least ~15% of frame height).
+        thumb_up = (
+            y(thumb_tip) < y(thumb_ip) < y(thumb_mcp)
+            and (y(wrist) - y(thumb_tip)) > 0.15
+        )
+        if not thumb_up:
+            return False
+
+        # Other fingers curled: fingertip lower (larger y) than its PIP joint.
+        finger_tips = (HLM.INDEX_FINGER_TIP, HLM.MIDDLE_FINGER_TIP,
+                       HLM.RING_FINGER_TIP, HLM.PINKY_TIP)
+        finger_pips = (HLM.INDEX_FINGER_PIP, HLM.MIDDLE_FINGER_PIP,
+                       HLM.RING_FINGER_PIP, HLM.PINKY_PIP)
+        curled = sum(
+            1 for tip, pip in zip(finger_tips, finger_pips) if y(tip) > y(pip)
+        )
+        # The thumb should also stick out from the curled fist horizontally a
+        # touch — guards against an open flat hand read as "all tips high".
+        return curled >= 3
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Rep state machine. Hysteresis between down/up to avoid bounce.
 # ---------------------------------------------------------------------------
@@ -166,6 +231,10 @@ class SquatCounter:
         self.fast_rep_sec = float(fast_rep_sec)
         # "shallow" = bottom angle > parallel threshold; parallel is target + buffer.
         self.parallel_deg = self.target_depth_deg + float(parallel_buffer_deg)
+        # A rep must bend to at least this knee angle (lower = deeper) to count.
+        # Sits a little above parallel so a real partial squat still counts, but a
+        # shallow bob that barely dips past DOWN_ENTER_DEG does not.
+        self.count_depth_deg = self.parallel_deg + COUNT_DEPTH_MARGIN_DEG
 
         self._s = _RepState()
         self.rep_count = 0
@@ -248,10 +317,13 @@ class SquatCounter:
                 total_frames = s.cam_frames + s.imu_frames
                 cam_frac = s.cam_frames / total_frames if total_frames else 0.0
 
-                # Validity gates.
+                # Validity gates. A rep must be a plausible tempo, mostly
+                # camera-tracked, AND actually reach a squat depth (not a shallow
+                # bob just past the descent threshold).
                 valid = (
                     MIN_REP_SEC <= tempo <= MAX_REP_SEC
                     and cam_frac >= MIN_CAM_FRAC
+                    and depth <= self.count_depth_deg
                 )
                 if valid:
                     self.rep_count += 1
@@ -309,6 +381,8 @@ class PoseTracker:
         profile: Optional[PTProfile] = None,
         on_ai_debrief: Optional[Callable[[str], None]] = None,
         on_profile_change: Optional[Callable[[PTProfile], None]] = None,
+        require_start_gesture: bool = True,
+        enable_gesture: bool = False,
     ):
         self.imu = imu_source or MockIMU()
         self.on_state = on_state or (lambda s: None)
@@ -340,7 +414,15 @@ class PoseTracker:
         # change rules mid-stream.
         self._pending_profile: Optional[PTProfile] = None
 
-        self.phase = "SET_ACTIVE"
+        # Set lifecycle. With require_start_gesture, the set waits for an explicit
+        # start (voice / button — and a thumbs-up too if enable_gesture) before
+        # counting; otherwise it behaves like the original always-on tracker.
+        #   WAITING_FOR_START -> COUNTDOWN -> SET_ACTIVE -> SET_END -> DEBRIEF
+        # enable_gesture toggles the thumbs-up hand gesture. Default off: the
+        # app drives start/end/advance via the voice agent + on-screen buttons.
+        self.require_start_gesture = require_start_gesture
+        self.enable_gesture = enable_gesture
+        self.phase = "WAITING_FOR_START" if require_start_gesture else "SET_ACTIVE"
         self.counter = self._fresh_counter()
         self.rom_min = 180.0
         self.rom_max = 0.0
@@ -350,6 +432,14 @@ class PoseTracker:
         self._set_emitted = False
         self._smoothed_angle: Optional[float] = None
         self._last_source: Optional[str] = None
+
+        # Gesture + countdown state.
+        self._start_requested = False          # external start (voice / button)
+        self._next_requested = False           # external advance during DEBRIEF
+        self._thumb_frames = 0                 # consecutive thumbs-up frames
+        self._thumbs_up_now = False            # this frame's raw detection
+        self._last_gesture_t = 0.0             # cooldown anchor
+        self._countdown_start: Optional[float] = None
 
         # Setup-status tracking.
         self._last_pose_t: Optional[float] = None
@@ -365,9 +455,24 @@ class PoseTracker:
         self._imu_frame_count = 0
         self._occlusion_events = 0
 
-    # ----- external control (manual end-set button from UI) -----
+    # ----- external control (manual buttons / voice from UI) -----
     def request_set_end(self) -> None:
         self._set_end_requested = True
+
+    def start_set(self) -> None:
+        """External trigger to start the set (voice 'start set' / Start button).
+
+        Honored from WAITING_FOR_START (begins the countdown) and from DEBRIEF
+        (advances to the next set, then waits for its start). Ignored mid-set.
+        """
+        if self.phase == "WAITING_FOR_START":
+            self._start_requested = True
+        elif self.phase in ("DEBRIEF", "SET_END"):
+            self._next_requested = True
+
+    def next_set(self) -> None:
+        """External trigger to advance to the next set after a debrief."""
+        self._next_requested = True
 
     def stop(self) -> None:
         self._stop = True
@@ -395,7 +500,9 @@ class PoseTracker:
             self._pending_profile = None
         if rep_target is not None:
             self.rep_target = int(rep_target)
-        self.phase = "SET_ACTIVE"
+        # New sets wait for a start gesture (unless the tracker is in always-on
+        # mode for legacy callers / tests).
+        self.phase = "WAITING_FOR_START" if self.require_start_gesture else "SET_ACTIVE"
         self.counter = self._fresh_counter()
         self.rom_min = 180.0
         self.rom_max = 0.0
@@ -409,6 +516,11 @@ class PoseTracker:
         self._cam_frame_count = 0
         self._imu_frame_count = 0
         self._occlusion_events = 0
+        # Gesture / countdown reset.
+        self._start_requested = False
+        self._next_requested = False
+        self._thumb_frames = 0
+        self._countdown_start = None
 
     # ----- per-frame pipeline -----
     def _extract_leg(self, landmarks) -> tuple[float, float, tuple, tuple, tuple]:
@@ -554,6 +666,83 @@ class PoseTracker:
             self._still_since = None
         return False
 
+    def _gesture_confirmed(self, frames_needed: int, now: float) -> bool:
+        """True once the thumbs-up has been held `frames_needed` frames and the
+        cooldown since the last fired gesture has elapsed. Fires once, then
+        resets the held-frame counter so a fresh hold is required next time."""
+        if (self._thumb_frames >= frames_needed
+                and now - self._last_gesture_t >= GESTURE_COOLDOWN_SEC):
+            self._last_gesture_t = now
+            self._thumb_frames = 0
+            return True
+        return False
+
+    # ----- set scoring -----
+    def _compute_score(
+        self, *, depths: list[float], hit_rate: float, depth_mean: float,
+        depth_std: float, reps_completed: int, fast_count: int,
+    ) -> dict:
+        """A 0-100 set score with a letter grade and per-component breakdown.
+
+        Components (each 0-100):
+          depth        — hit-rate at/below target, plus partial credit for how
+                          close the average bottom was to the prescribed depth.
+          consistency  — tight rep-to-rep depth (low stddev) scores high.
+          tempo        — fraction of reps that were NOT too fast (controlled).
+          completion   — reps completed vs the prescribed rep target.
+        """
+        if not depths:
+            return {
+                "overall": 0, "grade": "—",
+                "components": {"depth": 0, "consistency": 0,
+                               "tempo": 0, "completion": 0},
+                "headline": "No valid reps tracked.",
+            }
+        n = len(depths)
+        # Depth: 60% hit-rate, 40% closeness of the average to target (full
+        # credit at/below target, fading to 0 by ~25° shallow).
+        over = max(0.0, depth_mean - self.target_depth_deg)
+        closeness = max(0.0, 1.0 - over / 25.0)
+        depth01 = 0.6 * hit_rate + 0.4 * closeness
+        # Consistency: 0° stddev -> 1.0, >=15° -> 0.0.
+        consistency01 = max(0.0, 1.0 - depth_std / 15.0)
+        # Tempo control: penalize too-fast reps.
+        tempo01 = max(0.0, 1.0 - fast_count / n)
+        # Completion vs prescription.
+        completion01 = (
+            min(1.0, reps_completed / self.rep_target) if self.rep_target else 1.0
+        )
+        overall = round(
+            100 * (0.40 * depth01 + 0.20 * consistency01
+                   + 0.20 * tempo01 + 0.20 * completion01)
+        )
+        overall = max(0, min(100, overall))
+        grade = (
+            "A" if overall >= 90 else "B" if overall >= 80
+            else "C" if overall >= 70 else "D" if overall >= 60 else "F"
+        )
+        if overall >= 90:
+            headline = "Excellent set — depth, control, and consistency all on point."
+        elif overall >= 80:
+            headline = "Strong set with solid depth and control."
+        elif overall >= 70:
+            headline = "Good work — a few reps to clean up."
+        elif overall >= 60:
+            headline = "Fair set — depth or control slipped on several reps."
+        else:
+            headline = "Tough set — focus on hitting depth with control next time."
+        return {
+            "overall": overall,
+            "grade": grade,
+            "components": {
+                "depth": round(depth01 * 100),
+                "consistency": round(consistency01 * 100),
+                "tempo": round(tempo01 * 100),
+                "completion": round(completion01 * 100),
+            },
+            "headline": headline,
+        }
+
     # ----- summary builders -----
     @staticmethod
     def _mean(xs: list[float]) -> float:
@@ -667,6 +856,13 @@ class PoseTracker:
             tempo_mean=tempo_mean, tempo_trend=tempo_trend,
         )
 
+        # Set score (0-100 + grade + component breakdown).
+        score = self._compute_score(
+            depths=depths, hit_rate=hit_rate, depth_mean=depth_mean,
+            depth_std=depth_std, reps_completed=c.rep_count,
+            fast_count=c.flag_counts.get("too_fast", 0),
+        )
+
         # Top-level keeps the legacy 4d shape — Agent C wired against it.
         return {
             "exercise": "bodyweight_squat",
@@ -677,6 +873,8 @@ class PoseTracker:
             "depth_trend": legacy_depth_trend,
             "form_flag_counts": dict(c.flag_counts),
             "fatigue_signal": fatigue_label,
+            "set_score": score["overall"],
+            "score": score,
             # Richer breakdown for the AI agent (and the PT view).
             "analysis": {
                 "set_duration_sec": round(set_duration, 1),
@@ -848,6 +1046,17 @@ class PoseTracker:
             min_detection_confidence=0.6,
             min_tracking_confidence=0.6,
         )
+        # Lightweight Hands model for the thumbs-up start/end/advance gesture.
+        # Only created when gestures are enabled — the default voice-driven app
+        # leaves it off (saves CPU; start/end come from the voice agent).
+        hands = None
+        if self.enable_gesture:
+            hands = mp_hands.Hands(
+                model_complexity=0,
+                max_num_hands=1,
+                min_detection_confidence=0.6,
+                min_tracking_confidence=0.5,
+            )
 
         try:
             while not self._stop:
@@ -873,7 +1082,7 @@ class PoseTracker:
                     time.sleep(0.05)
                     continue
                 try:
-                    self._process_frame(frame, pose)
+                    self._process_frame(frame, pose, hands)
                 except Exception as e:    # keep the demo alive
                     print(f"[pose_tracker] frame error: {e}")
 
@@ -895,19 +1104,33 @@ class PoseTracker:
         finally:
             cap.release()
             pose.close()
+            if hands is not None:
+                hands.close()
             if self.show_window:
                 cv2.destroyAllWindows()
 
-    def _process_frame(self, frame, pose) -> None:
+    def _process_frame(self, frame, pose, hands=None) -> None:
         now = time.time()
         self._last_frame_t = now
-        if self._set_start_t is None:
-            self._set_start_t = now
 
         h, w = frame.shape[:2]
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         rgb.flags.writeable = False
         result = pose.process(rgb)
+
+        # ---- Thumbs-up gesture (debounced) ----
+        self._thumbs_up_now = False
+        if hands is not None:
+            try:
+                hres = hands.process(rgb)
+                if hres.multi_hand_landmarks:
+                    self._thumbs_up_now = any(
+                        detect_thumbs_up(hl.landmark)
+                        for hl in hres.multi_hand_landmarks
+                    )
+            except Exception as e:
+                print(f"[pose_tracker] hands error: {e}")
+        self._thumb_frames = self._thumb_frames + 1 if self._thumbs_up_now else 0
 
         leg_vis = 0.0
         leg_vis_min = 0.0
@@ -987,16 +1210,48 @@ class PoseTracker:
         self._last_source = tracking_source
         angle = self._smoothed_angle
 
-        # ---- ROM + reps ----
-        self.rom_min = min(self.rom_min, angle)
-        self.rom_max = max(self.rom_max, angle)
+        # ---- Lifecycle transitions (gesture / countdown / external) ----
+        countdown_remaining: Optional[float] = None
+        if self.phase == "WAITING_FOR_START":
+            # Start on a thumbs-up held while correctly positioned, or on an
+            # external start (voice / button — allowed regardless of framing).
+            gesture_start = (
+                bool(setup_status.get("ok"))
+                and self._gesture_confirmed(GESTURE_CONFIRM_FRAMES, now)
+            )
+            if gesture_start or self._start_requested:
+                self._start_requested = False
+                self._thumb_frames = 0
+                self.phase = "COUNTDOWN"
+                self._countdown_start = now
+        elif self.phase == "COUNTDOWN":
+            elapsed = now - (self._countdown_start or now)
+            countdown_remaining = max(0.0, COUNTDOWN_SEC - elapsed)
+            if elapsed >= COUNTDOWN_SEC:
+                self.phase = "SET_ACTIVE"
+                self._set_start_t = now
+                self._still_since = None
+                self.counter.pause_streaks()
+        elif self.phase in ("DEBRIEF", "SET_END"):
+            # Advance to the next set on a thumbs-up or external "next".
+            if (self._gesture_confirmed(GESTURE_CONFIRM_FRAMES, now)
+                    or self._next_requested):
+                self._next_requested = False
+                self.reset_set()
+
+        # ---- ROM + reps (only while the set is live) ----
         new_flags: list[str] = []
-        # Camera drives the rep state machine. IMU keeps the depth gauge alive
-        # during occlusion but won't increment reps on its own.
-        if self.phase == "SET_ACTIVE" and tracking_source == "camera":
-            new_flags = self.counter.update(angle, now, source="camera")
-        elif self.phase == "SET_ACTIVE":
-            self.counter.pause_streaks()
+        if self.phase == "SET_ACTIVE":
+            if self._set_start_t is None:
+                self._set_start_t = now
+            self.rom_min = min(self.rom_min, angle)
+            self.rom_max = max(self.rom_max, angle)
+            # Camera drives the rep state machine. IMU keeps the depth gauge
+            # alive during occlusion but won't increment reps on its own.
+            if tracking_source == "camera":
+                new_flags = self.counter.update(angle, now, source="camera")
+            else:
+                self.counter.pause_streaks()
         active_flags = self._update_active_flags(new_flags, now)
 
         # ---- Stuck-in-down recovery (user sat down / walked off mid-rep). ----
@@ -1007,14 +1262,18 @@ class PoseTracker:
         ):
             self.counter.force_reset_to_up()
 
-        # ---- Set-end detection ----
-        if self.phase == "SET_ACTIVE" and self._check_set_end(angle, now):
-            self.phase = "SET_END"
+        # ---- End the live set: thumbs-up hold, rep target, stillness, button ----
+        if self.phase == "SET_ACTIVE":
+            if self._gesture_confirmed(END_GESTURE_CONFIRM_FRAMES, now):
+                self._set_end_requested = True
+            if self._check_set_end(angle, now):
+                self.phase = "SET_END"
 
         self._emit_state(
             angle=angle, tracking_source=tracking_source,
             leg_vis=leg_vis, imu_quality=imu_quality,
             active_flags=active_flags, setup_status=setup_status,
+            countdown=countdown_remaining,
         )
 
         # ---- Set-end summary fires once. ----
@@ -1061,6 +1320,7 @@ class PoseTracker:
         self, *, angle: Optional[float], tracking_source: str,
         leg_vis: float, imu_quality: float,
         active_flags: list[str], setup_status: dict,
+        countdown: Optional[float] = None,
     ) -> None:
         # depth_state derived from current rep min if descending, else live angle.
         if angle is None:
@@ -1089,6 +1349,15 @@ class PoseTracker:
             "rep_depths": list(self.counter.rep_depths),
             "setup_status": setup_status,
             "profile": self.profile.to_dict(),
+            # Gesture + lifecycle hints for the dashboard.
+            "gesture": "thumbs_up" if self._thumbs_up_now else None,
+            "thumb_progress": round(
+                min(1.0, self._thumb_frames / GESTURE_CONFIRM_FRAMES), 2
+            ),
+            "countdown": (
+                int(math.ceil(countdown)) if countdown is not None and countdown > 0
+                else (0 if countdown is not None else None)
+            ),
         }
         try:
             self.on_state(state)
