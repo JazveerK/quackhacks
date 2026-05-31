@@ -4,17 +4,23 @@ export default function RepCounter({ state }) {
   const pct = target > 0 ? Math.min(100, (count / target) * 100) : 0
 
   return (
-    <div className="bg-white rounded-lg border border-hair p-4">
-      <div className="text-[10px] text-ink-faint tracking-wide mb-1">Reps</div>
-      <div className="flex items-baseline gap-2">
-        <span className="text-[48px] font-medium leading-none text-ink tabular-nums">
+    <div className="bg-white rounded-2xl p-5">
+      <div className="text-[12px] text-ink-faint font-medium uppercase tracking-wide mb-2">Reps</div>
+      <div className="flex items-baseline gap-2" aria-label={`${count} of ${target} reps completed`}>
+        <span className="text-[56px] font-semibold leading-none text-ink tabular-nums tracking-tight">
           {count}
         </span>
-        <span className="text-lg text-ink-faint">/ {target}</span>
+        <span className="text-[20px] font-medium text-ink-faint">/ {target}</span>
       </div>
-      <div className="mt-3 h-1 rounded-full bg-surface overflow-hidden">
+      <div
+        className="mt-4 h-2 rounded-full bg-surface overflow-hidden"
+        role="progressbar"
+        aria-valuenow={count}
+        aria-valuemin={0}
+        aria-valuemax={target}
+      >
         <div
-          className="h-full rounded-full bg-brand transition-all duration-200"
+          className="h-full rounded-full bg-brand transition-[width] duration-300 ease-out motion-reduce:transition-none"
           style={{ width: `${pct}%` }}
         />
       </div>

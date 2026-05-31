@@ -22,9 +22,11 @@
   --color-surface: #f1efe8;
 
   /* Hairline borders */
-  --color-hair: rgba(0,0,0,0.12);
+  --color-hair: rgba(0,0,0,0.08);
 
-  /* Radii */
+  /* Radii — Apple Health inspired, generous */
+  --radius-2xl: 20px;
+  --radius-xl: 16px;
   --radius-lg: 12px;
   --radius-md: 8px;
 
@@ -66,7 +68,33 @@ body {
   height: 4px;
   animation: voice-bar 1s ease-in-out infinite;
 }
+
+/* Apple Health-style animation tokens */
+@keyframes fadeInUp {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes slideInBottom {
+  from { transform: translateY(100%); }
+  to { transform: translateY(0); }
+}
+
+/* Stagger children for card entrance */
+.stagger-enter > * {
+  animation: fadeInUp 0.35s ease-out both;
+}
+.stagger-enter > *:nth-child(1) { animation-delay: 0ms; }
+.stagger-enter > *:nth-child(2) { animation-delay: 40ms; }
+.stagger-enter > *:nth-child(3) { animation-delay: 80ms; }
+.stagger-enter > *:nth-child(4) { animation-delay: 120ms; }
+.stagger-enter > *:nth-child(5) { animation-delay: 160ms; }
+.stagger-enter > *:nth-child(6) { animation-delay: 200ms; }
+.stagger-enter > *:nth-child(7) { animation-delay: 240ms; }
+.stagger-enter > *:nth-child(8) { animation-delay: 280ms; }
+
 @media (prefers-reduced-motion: reduce) {
   .voice-breathe, .voice-bar { animation: none; }
   .voice-bar { height: 11px; }
+  .stagger-enter > * { animation: none; }
 }

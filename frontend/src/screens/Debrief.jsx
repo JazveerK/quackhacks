@@ -114,10 +114,20 @@ export default function Debrief({ setScreen }) {
           ? Math.min(...depths)
           : 0
   const depthRange =
-    depths.length ? Math.max(...depths) - Math.min(...depths) : 0
+    depths.length ? Math.round(Math.max(...depths) - Math.min(...depths)) : 0
+  // Scale the bars off a sensible floor so they always read as a chart: span
+  // from a bit below the shallowest rep to a bit above the deepest/target.
   const maxBar = depths.length
     ? Math.max(...depths, (targetDepth || 0) + 10)
     : (targetDepth || 0) + 10
+  const minBar = depths.length
+    ? Math.max(0, Math.min(...depths, targetDepth || Infinity) - 10)
+    : 0
+  const barPct = (deg) => {
+    const span = maxBar - minBar
+    if (span <= 0) return 8
+    return Math.max(6, Math.min(100, ((deg - minBar) / span) * 100))
+  }
 
   const repsCompleted = summary.reps_completed ?? depths.length
 
@@ -231,31 +241,48 @@ export default function Debrief({ setScreen }) {
       <h4 className="text-xs font-medium text-ink-faint uppercase tracking-wide">
         Per-rep depth
       </h4>
-      <div className="relative flex items-end gap-1.5 h-40 pt-4">
+      {/* Fixed-height plot so the bars' percentage heights resolve against a
+          real box (they were collapsing to zero before). */}
+      <div className="relative flex items-stretch gap-1.5 h-44 pt-5">
         {targetDepth != null && (
           <div
-            className="absolute left-0 right-0 border-t border-dashed border-brand/40 z-10"
-            style={{ bottom: `${(targetDepth / maxBar) * 100}%` }}
+            className="absolute left-0 right-0 border-t border-dashed border-brand/50 z-10"
+            style={{ bottom: `${barPct(targetDepth)}%` }}
           >
-            <span className="absolute -top-4 right-0 text-[10px] text-brand">
-              {targetDepth}° target
+            <span className="absolute -top-4 right-0 text-[10px] font-medium text-brand">
+              {Math.round(targetDepth)}° target
             </span>
           </div>
         )}
         {depths.map((deg, i) => {
           const ok = reachedTarget(deg)
-          const pct = (deg / maxBar) * 100
           return (
-            <div key={i} className="flex-1 flex flex-col items-center gap-1">
-              <span className="text-[10px] text-ink-faint">{deg}°</span>
+            <div
+              key={i}
+              className="flex-1 flex flex-col justify-end items-center gap-1 h-full"
+            >
+              <span className="text-[10px] text-ink-faint tabular-nums">
+                {Math.round(deg)}°
+              </span>
               <div
-                className={`w-full rounded-t ${ok ? "bg-ok" : "bg-warn"}`}
-                style={{ height: `${pct}%` }}
+                className={`w-full rounded-t transition-all ${ok ? "bg-ok" : "bg-warn"}`}
+                style={{ height: `${barPct(deg)}%` }}
+                title={`Rep ${i + 1}: ${Math.round(deg)}°`}
               />
-              <span className="text-[10px] text-ink-faint">{i + 1}</span>
             </div>
           )
         })}
+      </div>
+      {/* Rep index axis */}
+      <div className="flex gap-1.5">
+        {depths.map((_, i) => (
+          <span
+            key={i}
+            className="flex-1 text-center text-[10px] text-ink-faint tabular-nums"
+          >
+            {i + 1}
+          </span>
+        ))}
       </div>
     </div>
   )

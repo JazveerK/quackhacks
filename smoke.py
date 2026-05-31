@@ -688,6 +688,184 @@ def t29_voice_agent_fallback():
             os.environ["GEMINI_API_KEY"] = saved
 
 
+def t30_kalman_tracks_camera_high_visibility():
+    print("\n[30] Kalman fusion: tracks the camera/pose angle at high visibility")
+    from pose_tracker import KalmanAngleFilter, KALMAN_K_IMU_THRESHOLD
+
+    kf = KalmanAngleFilter()
+    n = 120
+    errs = []
+    last_src = None
+    for i in range(n):
+        # A squat-like trace 80..160°; both camera and IMU see the same motion
+        # (camera with a little measurement noise) at solid visibility.
+        true = 120.0 - 40.0 * math.sin(2 * math.pi * i / 60.0)
+        cam = true + (1.5 if i % 2 else -1.5)   # small bounded camera noise
+        imu = true
+        fused, K = kf.step(cam, imu, 0.95)
+        if i > 5:
+            errs.append(abs(fused - true))
+            last_src = "imu" if K < KALMAN_K_IMU_THRESHOLD else "camera"
+    mean_err = sum(errs) / len(errs)
+    check("fused tracks pose within 3° (mean err)", mean_err < 3.0, "<3.0°", f"{mean_err:.2f}°")
+    check("source reads 'camera' at high visibility", last_src == "camera",
+          "camera", last_src)
+
+
+def t31_kalman_holds_imu_through_occlusion():
+    print("\n[31] Kalman fusion: visibility -> 0.1 holds the IMU, then re-anchors")
+    from pose_tracker import KalmanAngleFilter, KALMAN_K_IMU_THRESHOLD
+
+    def true_angle(i):
+        return 120.0 - 40.0 * math.sin(2 * math.pi * i / 60.0)
+
+    # Occluded landmarks don't hold a clean angle — they jitter. Model the camera
+    # during occlusion as the true motion plus large zero-mean noise (±25°), the
+    # case the visibility-adaptive R is designed to suppress. (A *persistent*
+    # camera bias would eventually leak through any relative-only IMU predictor;
+    # that's inherent, not a filter bug, so we don't model that here.)
+    def noisy_cam(i, t):
+        return t + (25.0 if i % 2 else -25.0)
+
+    kf = KalmanAngleFilter()
+    i = 0
+    # Phase 1: high visibility — the filter locks onto the true motion.
+    for _ in range(60):
+        t = true_angle(i)
+        kf.step(t + (1.0 if i % 2 else -1.0), t, 0.95)
+        i += 1
+
+    # Phase 2: occlusion (vis 0.1). IMU keeps reporting the true squat motion;
+    # the camera is unreliable. Run a SECOND filter on the same noisy camera but
+    # at HIGH visibility, to show R = R_base/v^2 actually down-weights the camera.
+    kf_hi = KalmanAngleFilter()
+    # Seed the contrast filter at the same state.
+    kf_hi.x, kf_hi.P, kf_hi._prev_imu = kf.x, kf.P, kf._prev_imu
+    occ_err, occ_fused, srcs = [], [], []
+    hi_err = []
+    for _ in range(50):
+        t = true_angle(i)
+        cam = noisy_cam(i, t)
+        fused, K = kf.step(cam, t, 0.1)
+        fused_hi, _ = kf_hi.step(cam, t, 0.95)
+        occ_err.append(abs(fused - t))
+        occ_fused.append(fused)
+        hi_err.append(abs(fused_hi - t))
+        srcs.append("imu" if K < KALMAN_K_IMU_THRESHOLD else "camera")
+        i += 1
+    mean_err = sum(occ_err) / len(occ_err)
+    mean_hi_err = sum(hi_err) / len(hi_err)
+    fused_range = max(occ_fused) - min(occ_fused)
+    imu_frac = srcs.count("imu") / len(srcs)
+    check("occluded: noisy camera rejected, fused follows IMU (<6°)", mean_err < 6.0,
+          "<6.0°", f"{mean_err:.2f}°")
+    check("occluded: NOT frozen — fused still swings with the squat (>50°)",
+          fused_range > 50.0, ">50°", f"{fused_range:.1f}°")
+    check("occluded: source reads 'imu' throughout", imu_frac == 1.0,
+          "1.0", f"{imu_frac:.2f}")
+    check("visibility-adaptive: low-vis rejects camera noise better than high-vis",
+          mean_err < mean_hi_err, f"<{mean_hi_err:.2f}°", f"{mean_err:.2f}°")
+
+    # Phase 3: visibility returns — the camera re-anchors the estimate.
+    re_src = None
+    re_err = None
+    for _ in range(40):
+        t = true_angle(i)
+        fused, K = kf.step(t + (1.0 if i % 2 else -1.0), t, 0.95)
+        re_src = "imu" if K < KALMAN_K_IMU_THRESHOLD else "camera"
+        re_err = abs(fused - t)
+        i += 1
+    check("recovered: source re-anchors to 'camera'", re_src == "camera",
+          "camera", re_src)
+    check("recovered: fused back on the pose angle (<3°)", re_err < 3.0,
+          "<3.0°", f"{re_err:.2f}°")
+
+
+def t32_imu_toggle_and_kalman_fallback():
+    print("\n[32] IMU toggle gates fusion; bad input never crashes the filter")
+    from pose_tracker import KalmanAngleFilter
+
+    tracker = PoseTracker(show_window=False)
+    check("imu_enabled defaults True", tracker.imu_enabled is True, True, tracker.imu_enabled)
+    tracker.set_imu_enabled(False)
+    check("set_imu_enabled(False) takes", tracker.imu_enabled is False, False, tracker.imu_enabled)
+    tracker.set_imu_enabled(True)
+    check("set_imu_enabled(True) takes", tracker.imu_enabled is True, True, tracker.imu_enabled)
+
+    # NaN / None inputs must never raise and never poison the state.
+    kf = KalmanAngleFilter()
+    ok = True
+    try:
+        kf.step(float("nan"), None, 0.0)        # all-bad before any seed -> (None, None)
+        kf.step(100.0, None, 0.9)               # seed on camera
+        kf.step(float("nan"), float("inf"), 0.9)  # garbage update ignored
+        f, _ = kf.step(110.0, None, 0.9)
+    except Exception as e:
+        ok = False
+        f = None
+        print(f"    raised: {e}")
+    check("filter survives NaN/inf/None input", ok, True, ok)
+    check("fused angle stays finite", f is not None and math.isfinite(f), "finite", f)
+
+
+def t33_fusion_weight_ramps_continuously():
+    print("\n[33] Fusion blend weight slides continuously through an occlusion ramp")
+    from pose_tracker import (
+        PoseTracker, FUSION_WEIGHT_EMA_ALPHA, KALMAN_K_IMU_THRESHOLD,
+    )
+
+    # The dashboard consumes the EMITTED fusion_weight (visibility-adaptive v^2,
+    # EMA-smoothed), not the raw Kalman gain. Drive landmark visibility down an
+    # occlusion ramp 0.9 -> 0.1 and back, exactly as _process_frame would, and
+    # confirm the emitted weight slides smoothly rather than snapping.
+    vis_ramp = (
+        [0.9 - 0.8 * (j / 29.0) for j in range(30)]      # 0.9 -> 0.1 down
+        + [0.1 + 0.8 * (j / 29.0) for j in range(30)]    # 0.1 -> 0.9 back up
+    )
+
+    # Replicate the per-frame raw_w -> EMA the tracker applies, using the real
+    # weight-mapping helper and the real module constant (regression guard on the
+    # tuning, not a re-implementation of the formula).
+    ema = None
+    weights = []
+    for v in vis_ramp:
+        raw_w = PoseTracker._fusion_weight_from_visibility(v, imu_on=True, has_signal=True)
+        ema = raw_w if ema is None else (
+            FUSION_WEIGHT_EMA_ALPHA * raw_w + (1.0 - FUSION_WEIGHT_EMA_ALPHA) * ema
+        )
+        weights.append(ema)
+
+    down = weights[:30]
+    up = weights[30:]
+    max_step = max(abs(weights[j] - weights[j - 1]) for j in range(1, len(weights)))
+    # Continuity: no instantaneous jump (a binary switch would be ~1.0 in a frame).
+    check("blend weight never jumps (max single-frame step < 0.15)",
+          max_step < 0.15, "<0.15", f"{max_step:.3f}")
+    # Sits high (~camera) at full visibility; the meter reads "mostly camera".
+    check("≈camera at full visibility (w > 0.7)", weights[0] > 0.7,
+          ">0.70", f"{weights[0]:.2f}")
+    # Slides DOWN as visibility falls, then back UP as it recovers.
+    check("weight slides down as visibility falls", down[-1] < down[0] - 0.4,
+          f"<{down[0] - 0.4:.2f}", f"{down[-1]:.2f}")
+    check("weight recovers as visibility returns", up[-1] > up[0] + 0.4,
+          f">{up[0] + 0.4:.2f}", f"{up[-1]:.2f}")
+    # Both sensors ALWAYS contribute — weight stays strictly inside (0,1).
+    check("never snaps fully to one sensor (0 < w < 1 throughout)",
+          all(0.0 < w < 1.0 for w in weights), "all in (0,1)",
+          f"min={min(weights):.3f} max={max(weights):.3f}")
+    # The dramatic moment still happens: weight crosses the IMU-carry threshold
+    # near the bottom of the ramp.
+    check("crosses IMU-carry threshold at peak occlusion",
+          min(weights) < KALMAN_K_IMU_THRESHOLD,
+          f"<{KALMAN_K_IMU_THRESHOLD}", f"{min(weights):.3f}")
+
+    # Camera-only mode (IMU off) pins the weight fully to the camera.
+    camera_only = PoseTracker._fusion_weight_from_visibility(0.3, imu_on=False, has_signal=True)
+    check("IMU off => weight pinned to camera (1.0)", camera_only == 1.0, 1.0, camera_only)
+    no_signal = PoseTracker._fusion_weight_from_visibility(0.0, imu_on=True, has_signal=False)
+    check("no signal => weight is None", no_signal is None, None, no_signal)
+
+
 # ---------------------------------------------------------------------------
 # Main.
 # ---------------------------------------------------------------------------
@@ -711,7 +889,11 @@ def main() -> int:
                t25_bq_next_recommendation_uses_analysis,
                t26_session_report_no_key_is_silent,
                t27_thumbs_up_detection, t28_set_score,
-               t29_voice_agent_fallback):
+               t29_voice_agent_fallback,
+               t30_kalman_tracks_camera_high_visibility,
+               t31_kalman_holds_imu_through_occlusion,
+               t32_imu_toggle_and_kalman_fallback,
+               t33_fusion_weight_ramps_continuously):
         fn()
     print("=" * 72)
     passed = sum(results)

@@ -239,6 +239,8 @@ AGENT_ACTIONS = {
     "none", "start_set", "end_set", "next_set", "end_session",
     # Navigation — lets the patient run the app entirely hands-free.
     "go_checkin", "go_live", "go_debrief", "go_clinician",
+    # Record a symptom / observation onto the session for the clinician handoff.
+    "note",
 }
 
 _AGENT_PROMPT = """You are SteadyPT's voice coach — a warm, encouraging physical-therapy
@@ -257,6 +259,9 @@ You can take ACTIONS by setting the "action" field (infer intent, don't match ex
 - "go_live"     : show the live workout screen / "take me to the workout" / "live view".
 - "go_debrief"  : show the debrief / results screen / "show my results" / "how did the set go" (screen).
 - "go_clinician": show the clinician / PT screen / "open the clinician view" / "PT dashboard".
+- "note"        : the patient wants to record a symptom/observation for their PT —
+  "note that my right knee hurts", "make a note: felt a twinge", "my knee is sore today".
+  Acknowledge warmly that you've noted it (and gently suggest telling their PT if it's pain).
 - "none"        : just converse — answer a question, encourage, chat. No action.
 
 Only choose start_set when the phase is WAITING_FOR_START or DEBRIEF. Only choose end_set
@@ -291,6 +296,10 @@ def _converse_fallback(text: str) -> dict:
     """Keyword-based intent so voice still controls the app when Gemini is
     unavailable. Mirrors the action vocabulary of the LLM path."""
     t = (text or "").lower()
+    if t.startswith("note") or "make a note" in t or "note that" in t or (
+        "note" in t and any(w in t for w in ("hurt", "sore", "pain", "twinge", "ache"))
+    ):
+        return {"speech": "Got it — I've noted that for your PT.", "action": "note"}
     if ("session" in t or "workout" in t) and any(w in t for w in ("end", "finish", "done", "wrap")):
         return {"speech": "Wrapping up your session now.", "action": "end_session"}
     if "next" in t:

@@ -1,13 +1,8 @@
-import { useState, useEffect, useRef, useCallback } from "react"
+import { useState, useEffect, useCallback } from "react"
 import Card from "../components/Card"
 import Chip from "../components/Chip"
 import PrimaryButton from "../components/PrimaryButton"
 import { useSession } from "../SocketContext"
-
-// ── Speech recognition (on-device only) ──────────────────────────────
-const SR = typeof window !== "undefined"
-  ? window.SpeechRecognition || window.webkitSpeechRecognition
-  : null
 
 // ══════════════════════════════════════════════════════════════════════
 //  CHECK-IN FLOW
@@ -47,13 +42,15 @@ function Stepper({ label, value, min, max, onChange }) {
   )
 }
 
-function CheckInFlow({ setScreen, switchToIntake, micAvailable, workout, setWorkout, setWorkoutPos }) {
+function CheckInFlow({ setScreen, switchToIntake, workout, setWorkout, setWorkoutPos }) {
   const { send } = useSession()
 
   const [kneeScore, setKneeScore] = useState(null)
   const [pain, setPain] = useState(null)
-  const [listening, setListening] = useState(false)
-  const recRef = useRef(null)
+
+  // IMU sensor fusion toggle. On (default) keeps tracking your depth when the
+  // camera loses sight of the leg; off runs camera-only.
+  const [useIMU, setUseIMU] = useState(true)
 
   // ── Exercise catalogue + workout builder ───────────────────────────
   const [exercises, setExercises] = useState([])
@@ -140,58 +137,31 @@ function CheckInFlow({ setScreen, switchToIntake, micAvailable, workout, setWork
   }, [docText, generating, fetchExercises])
 
   // Begin the session: install the first exercise + its rep target, then go live.
+  // If the user hasn't explicitly "added" anything yet, fall back to whatever's
+  // selected in the picker so a single tap on Start just works.
   const startSession = useCallback(() => {
-    if (!workout.length) return
-    const first = workout[0]
+    let plan = workout
+    if (!plan.length) {
+      const ex = exercises.find((e) => e.id === pickId)
+      if (!ex) return
+      plan = [{ id: ex.id, name: ex.display_name, sets: pickSets, reps: pickReps }]
+      setWorkout(plan)
+    }
+    const first = plan[0]
+    send({ cmd: "set_imu", enabled: useIMU })
     send({ cmd: "select_exercise", id: first.id })
     send({ cmd: "reset_set", rep_target: first.reps })
     send({ cmd: "start_set" })
     setWorkoutPos({ ex: 0, set: 1 })
     setScreen("live")
-  }, [workout, send, setWorkoutPos, setScreen])
+  }, [workout, exercises, pickId, pickSets, pickReps, useIMU, send, setWorkout, setWorkoutPos, setScreen])
 
+  // The session can start once there's either a built plan or a valid pick.
+  const canStart = workout.length > 0 || !!pickId
   const totalSets = workout.reduce((n, ex) => n + ex.sets, 0)
 
   // Which question is "active" (first unanswered)
   const activeQ = kneeScore == null ? 1 : pain == null ? 2 : 3
-
-  // ── Mic toggle ───────────────────────────────────────────────────
-  const toggleMic = useCallback(() => {
-    if (!micAvailable || !SR) return
-    if (listening) {
-      recRef.current?.stop()
-      setListening(false)
-      return
-    }
-    const rec = new SR()
-    rec.lang = "en-US"
-    rec.continuous = false
-    rec.interimResults = false
-    recRef.current = rec
-
-    rec.onresult = (e) => {
-      const t = e.results[0][0].transcript.toLowerCase()
-      // Q1: number 1-10
-      const num = parseInt(t.replace(/\D/g, ""), 10)
-      if (kneeScore == null && num >= 1 && num <= 10) {
-        setKneeScore(num)
-      }
-      // Q2: pain
-      if (pain == null) {
-        const match = PAIN_OPTIONS.find((o) => t.includes(o.toLowerCase()))
-        if (match) setPain(match)
-      }
-      setListening(false)
-    }
-    rec.onerror = () => setListening(false)
-    rec.onend = () => setListening(false)
-    rec.start()
-    setListening(true)
-  }, [listening, micAvailable, kneeScore, pain])
-
-  useEffect(() => {
-    return () => recRef.current?.abort()
-  }, [])
 
   function qBadge(n) {
     if (
@@ -222,32 +192,12 @@ function CheckInFlow({ setScreen, switchToIntake, micAvailable, workout, setWork
   return (
     <div className="flex flex-col gap-4">
       {/* Header area */}
-      <div className="flex items-start justify-between">
-        <div>
-          <h2 className="text-lg font-semibold text-ink">Hi again.</h2>
-          <p className="text-sm text-ink-soft mt-1 max-w-md">
-            Quick check, then build today's workout — tap an answer, or use the
-            mic to speak.
-          </p>
-        </div>
-        <button
-          type="button"
-          onClick={toggleMic}
-          disabled={!micAvailable}
-          title={micAvailable ? (listening ? "Listening…" : "Tap to speak") : "On-device speech not available"}
-          className={`relative w-10 h-10 rounded-full flex items-center justify-center transition-colors ${
-            listening
-              ? "bg-brand text-white"
-              : micAvailable
-                ? "bg-surface text-ink-soft hover:text-ink"
-                : "bg-surface text-ink-faint cursor-not-allowed opacity-50"
-          }`}
-        >
-          <i className="ti ti-microphone text-lg" />
-          {listening && (
-            <span className="absolute inset-0 rounded-full border-2 border-brand animate-ping" />
-          )}
-        </button>
+      <div>
+        <h2 className="text-lg font-semibold text-ink">Hi again.</h2>
+        <p className="text-sm text-ink-soft mt-1 max-w-md">
+          Quick check, then build today's workout — tap an answer, or use the
+          voice assistant in the bottom corner.
+        </p>
       </div>
 
       {/* Q1 — Knee score */}
@@ -435,6 +385,44 @@ function CheckInFlow({ setScreen, switchToIntake, micAvailable, workout, setWork
         </div>
       </Card>
 
+      {/* IMU sensor-fusion toggle */}
+      <Card>
+        <button
+          type="button"
+          onClick={() => setUseIMU((v) => !v)}
+          aria-pressed={useIMU}
+          className="flex items-center gap-3 w-full text-left"
+        >
+          <span
+            className={`w-9 h-9 rounded-full flex items-center justify-center shrink-0 transition-colors ${
+              useIMU ? "bg-brand-bg text-brand" : "bg-surface text-ink-faint"
+            }`}
+          >
+            <i className="ti ti-cpu text-lg" />
+          </span>
+          <span className="flex-1 min-w-0">
+            <span className="block text-sm font-medium text-ink">
+              IMU sensor fusion
+            </span>
+            <span className="block text-xs text-ink-soft">
+              Keeps tracking your depth when the camera loses sight of your leg.
+            </span>
+          </span>
+          {/* Switch */}
+          <span
+            className={`relative w-11 h-6 rounded-full shrink-0 transition-colors ${
+              useIMU ? "bg-brand" : "bg-hair"
+            }`}
+          >
+            <span
+              className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform ${
+                useIMU ? "translate-x-5" : "translate-x-0"
+              }`}
+            />
+          </span>
+        </button>
+      </Card>
+
       {/* Footer */}
       <div className="flex items-center justify-between">
         <button
@@ -450,13 +438,17 @@ function CheckInFlow({ setScreen, switchToIntake, micAvailable, workout, setWork
               {workout.length} exercise{workout.length > 1 ? "s" : ""} ·{" "}
               {totalSets} set{totalSets > 1 ? "s" : ""}
             </span>
+          ) : canStart ? (
+            <span className="text-xs text-ink-faint">
+              Starts with {pickSets} × {pickReps}
+            </span>
           ) : (
             <span className="text-xs text-ink-faint">No exercises added</span>
           )}
           <PrimaryButton
             onClick={startSession}
             arrow
-            className={!workout.length ? "opacity-50 pointer-events-none" : ""}
+            className={!canStart ? "opacity-50 pointer-events-none" : ""}
           >
             Start workout
           </PrimaryButton>
@@ -487,6 +479,26 @@ function IntakeFlow({ switchToCheckin }) {
   const [timeline, setTimeline] = useState(null)
   const [ptName, setPtName] = useState("")
   const [notes, setNotes] = useState("")
+  // Age + biological sex drive the age-normed sit-to-stand interpretation in
+  // the clinician handoff. Posted to /user-context before the session ends.
+  const [age, setAge] = useState("")
+  const [sexAtBirth, setSexAtBirth] = useState(null)
+
+  const handleSave = useCallback(async () => {
+    const ageNum = parseInt(age, 10)
+    if (ageNum >= 1 && ageNum <= 120 && (sexAtBirth === "male" || sexAtBirth === "female")) {
+      try {
+        await fetch("/user-context", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ age: ageNum, sex_at_birth: sexAtBirth }),
+        })
+      } catch {
+        // Best-effort — the session still runs without norm-stratified handoff.
+      }
+    }
+    switchToCheckin()
+  }, [age, sexAtBirth, switchToCheckin])
 
   return (
     <div className="flex flex-col gap-4">
@@ -506,6 +518,38 @@ function IntakeFlow({ switchToCheckin }) {
           physical therapist. We don't diagnose or prescribe exercises.
         </p>
       </div>
+
+      {/* Profile basics — used for age-normed reference ranges (sit-to-stand) */}
+      <Card>
+        <h3 className="text-sm font-medium text-ink mb-1">Profile basics</h3>
+        <p className="text-xs text-ink-soft mb-3">
+          Used for age-normed reference ranges in your clinician handoff.
+        </p>
+        <div className="flex flex-wrap items-end gap-4">
+          <div className="flex flex-col gap-1">
+            <span className="text-[10px] text-ink-faint tracking-wide">Age</span>
+            <input
+              type="number"
+              min="1"
+              max="120"
+              value={age}
+              onChange={(e) => setAge(e.target.value)}
+              placeholder="—"
+              className="w-24 h-9 px-3 rounded-lg border border-hair bg-white text-sm text-ink placeholder:text-ink-faint focus:outline-none focus:ring-1 focus:ring-brand"
+            />
+          </div>
+          <div className="flex flex-col gap-1">
+            <span className="text-[10px] text-ink-faint tracking-wide">Sex at birth</span>
+            <div className="flex flex-wrap gap-2">
+              {["female", "male"].map((opt) => (
+                <Chip key={opt} selected={sexAtBirth === opt} onClick={() => setSexAtBirth(opt)}>
+                  {opt[0].toUpperCase() + opt.slice(1)}
+                </Chip>
+              ))}
+            </div>
+          </div>
+        </div>
+      </Card>
 
       {/* Q: Body area */}
       <Card>
@@ -585,7 +629,7 @@ function IntakeFlow({ switchToCheckin }) {
         >
           I'll do this later
         </button>
-        <PrimaryButton onClick={switchToCheckin} arrow>
+        <PrimaryButton onClick={handleSave} arrow>
           Save and start
         </PrimaryButton>
       </div>
@@ -599,28 +643,6 @@ function IntakeFlow({ switchToCheckin }) {
 
 export default function CheckIn({ setScreen, workout, setWorkout, setWorkoutPos }) {
   const [mode, setMode] = useState("checkin")
-  const [micAvailable, setMicAvailable] = useState(false)
-
-  // Check on-device speech recognition availability
-  useEffect(() => {
-    if (!SR) return
-    // SR.available is a newer API — guard against browsers that don't have it
-    if (typeof SR.available === "function") {
-      SR.available({ langs: ["en-US"], processLocally: true })
-        .then((result) => {
-          // result may be "available", "downloadable", or an object with .available
-          const ok = result === "available" || result?.available === true
-          setMicAvailable(ok)
-        })
-        .catch(() => setMicAvailable(false))
-    } else {
-      // Older browsers: SR exists but no availability check — allow it on
-      // localhost/HTTPS only (required for getUserMedia/SR anyway)
-      const secure =
-        location.protocol === "https:" || location.hostname === "localhost"
-      setMicAvailable(secure)
-    }
-  }, [])
 
   if (mode === "intake") {
     return (
@@ -632,7 +654,6 @@ export default function CheckIn({ setScreen, workout, setWorkout, setWorkoutPos 
     <CheckInFlow
       setScreen={setScreen}
       switchToIntake={() => setMode("intake")}
-      micAvailable={micAvailable}
       workout={workout}
       setWorkout={setWorkout}
       setWorkoutPos={setWorkoutPos}

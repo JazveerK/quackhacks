@@ -155,12 +155,13 @@ def insert_session(
     total_reps: int,
     avg_depth: float,
     adherence_flag: str,
+    sts_observation: Optional[dict] = None,
 ) -> bool:
     """Write one row to the `sessions` table.
 
-    Schema matches CONTEXT.md §4e:
+    Schema matches CONTEXT.md §4e + clinician handoff extension:
         sessions(session_id, user_id, exercise, started_at, sets_count,
-                 total_reps, avg_depth, adherence_flag)
+                 total_reps, avg_depth, adherence_flag, sts_observation)
     """
     table = _sessions_table()
     if table is None:
@@ -177,6 +178,9 @@ def insert_session(
         "avg_depth": float(round(avg_depth, 2)),
         "adherence_flag": adherence_flag[:64],
     }
+    if sts_observation is not None:
+        import json as _json
+        row["sts_observation"] = _json.dumps(sts_observation)
     try:
         client = init_client()
         errors = client.insert_rows_json(table, [row])
@@ -213,6 +217,40 @@ def query_session_sets(session_id: str) -> list[dict]:
     except Exception as e:
         print(f"[bq] query_session_sets exception: {e.__class__.__name__}: {e}")
         return []
+
+
+def query_session(session_id: str) -> Optional[dict]:
+    """Fetch a single session row by ID. Returns None if not found / BQ unavailable."""
+    table = _sessions_table()
+    if table is None:
+        return None
+    try:
+        from google.cloud import bigquery
+        client = init_client()
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("sid", "STRING", session_id),
+            ]
+        )
+        rows = list(client.query(
+            f"SELECT * FROM `{table}` WHERE session_id = @sid LIMIT 1",
+            job_config=job_config,
+        ).result())
+        if not rows:
+            return None
+        row = dict(rows[0])
+        # Parse sts_observation back from its JSON string column if present.
+        obs = row.get("sts_observation")
+        if obs and isinstance(obs, str):
+            import json as _json
+            try:
+                row["sts_observation"] = _json.loads(obs)
+            except Exception:
+                pass
+        return row
+    except Exception as e:
+        print(f"[bq] query_session exception: {e.__class__.__name__}: {e}")
+        return None
 
 
 def query_recent_sets(limit: int = 50) -> list[dict]:

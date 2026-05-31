@@ -47,6 +47,7 @@ import tts
 import exercise_spec
 import spec_generator
 from exercise_spec import ExerciseSpec
+from fhir_observation import build_sts_observation, QUALITY_THRESHOLD
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -140,17 +141,30 @@ _session_lock = threading.Lock()
 # Voice-agent conversation history for the current session (capped, in-memory).
 conversation: list[dict] = []
 
+# Patient-spoken notes for this session ("note that my right knee hurts"),
+# surfaced to the clinician handoff. Reset each new session.
+session_notes: list[dict] = []
+
+# User context for clinician handoff (age + sex_at_birth), set via
+# POST /user-context before or during a session. Drives norm-stratified STS.
+_user_context: dict = {}
+
+# In-memory FHIR Observation store keyed by session_id — demo fallback for the
+# clinician handoff page when BigQuery is unavailable.
+_observation_store: dict[str, dict] = {}
+
 
 def _new_session() -> None:
     """Reset to a fresh session_id + counters. Called by POST /session/end
     after the closing session row is written."""
-    global SESSION_ID, SESSION_STARTED_AT, set_index, session_summaries, conversation
+    global SESSION_ID, SESSION_STARTED_AT, set_index, session_summaries, conversation, session_notes
     with _session_lock:
         SESSION_ID = uuid.uuid4().hex[:8]
         SESSION_STARTED_AT = datetime.now(timezone.utc)
         set_index = 0
         session_summaries = []
         conversation = []
+        session_notes = []
 
 
 def _on_set_end(summary: dict) -> None:
@@ -171,11 +185,89 @@ def _on_set_end(summary: dict) -> None:
     bridge.push_set_summary(summary)
 
 
+def _make_imu_source():
+    """Pick the IMU backend: real serial IMU if a port is available, else MockIMU.
+
+    Set PF_IMU_PORT to force a specific serial device. PF_IMU_PORT="mock" (or no
+    port found) keeps MockIMU so the app runs with no hardware. The real reader
+    is resilient — it survives an absent/unplugged Arduino — but we only reach for
+    it when a port is actually present so a no-hardware dev run shows a healthy
+    mock signal instead of a dead "none" source.
+    """
+    port = os.environ.get("PF_IMU_PORT", "").strip()
+    if port.lower() == "mock":
+        print("[server] PF_IMU_PORT=mock -> using MockIMU.")
+        return MockIMU()
+    try:
+        from imu import IMU, find_imu_port
+        port = port or find_imu_port()
+        if not port:
+            print("[server] No IMU serial port found -> using MockIMU.")
+            return MockIMU()
+        print(f"[server] Using real IMU on {port}.")
+        return IMU(port=port)
+    except Exception as e:
+        print(f"[server] IMU init failed ({e}); using MockIMU.")
+        return MockIMU()
+
+
+def _select_camera_index() -> int:
+    """Pick which camera to open.
+
+    PF_CAMERA forces a specific index. Otherwise, on macOS we try to prefer an
+    iPhone Continuity Camera: it advertises a much higher resolution (1080p+)
+    than the built-in FaceTime camera, so we probe a few indices and take the
+    highest-resolution one. This is a heuristic — if it grabs the wrong camera,
+    set PF_CAMERA=N to pin a specific index.
+    """
+    env = os.environ.get("PF_CAMERA", "").strip()
+    if env:
+        try:
+            return int(env)
+        except ValueError:
+            print(f"[server] ignoring non-integer PF_CAMERA={env!r}")
+
+    import sys
+    if sys.platform != "darwin":
+        return 0
+
+    try:
+        import cv2
+    except Exception:
+        return 0
+
+    backend = getattr(cv2, "CAP_AVFOUNDATION", 0)
+    best_idx, best_res = 0, -1
+    for idx in range(4):
+        cap = None
+        try:
+            cap = cv2.VideoCapture(idx, backend)
+            if not cap.isOpened():
+                continue
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                continue
+            h, w = frame.shape[:2]
+            res = w * h
+            print(f"[server] camera probe: index {idx} -> {w}x{h}")
+            if res > best_res:
+                best_idx, best_res = idx, res
+        except Exception as e:
+            print(f"[server] camera probe index {idx} failed: {e}")
+        finally:
+            if cap is not None:
+                cap.release()
+
+    label = "iPhone/Continuity heuristic" if best_res > 0 else "default"
+    print(f"[server] using camera index {best_idx} ({label}); override with PF_CAMERA=N")
+    return best_idx
+
+
 def _start_tracker() -> None:
     global tracker, tracker_thread
-    camera_index = int(os.environ.get("PF_CAMERA", "0"))
+    camera_index = _select_camera_index()
     tracker = PoseTracker(
-        imu_source=MockIMU(),
+        imu_source=_make_imu_source(),
         on_state=bridge.push_state,
         on_set_end=_on_set_end,
         on_frame=bridge.push_frame,
@@ -410,6 +502,85 @@ async def get_session():
         })
 
 
+def _build_sts_observation(sid, user_id, started_at, summaries, total_reps,
+                           sets_count, active_profile):
+    """Build a FHIR STS Observation for the clinician handoff (best-effort).
+
+    Returns (observation_dict | None, share_url | None). Requires age +
+    sex_at_birth in the live _user_context; otherwise returns (None, None).
+    Stores the observation in _observation_store so /share can serve it even
+    without BigQuery.
+    """
+    if not (_user_context.get("age") and _user_context.get("sex_at_birth")):
+        return None, None
+
+    conf_values = [
+        float(s.get("tracking_confidence_mean", s.get("fusion_confidence", 0.0)))
+        for s in summaries
+    ]
+    tracking_conf_mean = sum(conf_values) / len(conf_values) if conf_values else 0.0
+    concentric_vals = [float(s.get("mean_concentric_s", 1.0)) for s in summaries]
+    eccentric_vals = [float(s.get("mean_eccentric_s", 1.0)) for s in summaries]
+    all_depths_raw = []
+    for s in summaries:
+        all_depths_raw.extend(s.get("rep_depths_deg") or [])
+    peak_flexion = float(min(all_depths_raw)) if all_depths_raw else 180.0
+
+    obs_session = {
+        "session_id": sid,
+        "patient_ref": f"Patient/{user_id}",
+        "effective_dt": started_at.isoformat(),
+        "issued_dt": datetime.now(timezone.utc).isoformat(),
+        "reps": total_reps,
+        "age": _user_context["age"],
+        "sex": _user_context["sex_at_birth"],
+        "uses_arm_support": False,
+        "tracking_source": "fused",
+        "tracking_confidence_mean": round(tracking_conf_mean, 3),
+        "calibration_id": f"cal-{sid}",
+        "mean_concentric_s": round(sum(concentric_vals) / len(concentric_vals), 2) if concentric_vals else 1.0,
+        "mean_eccentric_s": round(sum(eccentric_vals) / len(eccentric_vals), 2) if eccentric_vals else 1.0,
+        "peak_knee_flexion_deg": peak_flexion,
+        "rom_delta_vs_baseline_deg": 0.0,
+        "pain_nprs": None,
+        "adherence_completed": sets_count,
+        "adherence_prescribed": int(active_profile.sets),
+        "clinical_flags": {
+            "rom_regression": False,
+            "tempo_guarding": False,
+            "progression_stalled": False,
+        },
+    }
+    try:
+        sts_obs = build_sts_observation(obs_session)
+    except ValueError as e:
+        # Age outside the validated 60-94 range — build a raw observation
+        # without norm classification (fhir_observation §6).
+        print(f"[server] FHIR observation: age out of range, building without norms: {e}")
+        from fhir_observation import _component  # noqa: F401  (kept for parity)
+        sts_obs = {
+            "resourceType": "Observation",
+            "id": sid,
+            "meta": {"tag": [{"system": "urn:physiofusion:tags", "code": "patient-administered-remote-assessment"}]},
+            "status": "final" if tracking_conf_mean >= QUALITY_THRESHOLD else "preliminary",
+            "code": {"coding": [{"system": "http://loinc.org", "code": "66247-8", "display": "30-second Chair Stand Test"}]},
+            "subject": {"reference": f"Patient/{user_id}"},
+            "effectiveDateTime": started_at.isoformat(),
+            "valueQuantity": {"value": total_reps, "unit": "reps"},
+            "note": [
+                {"text": "This observation is observational data intended for clinician review and is NOT a clinical diagnosis."},
+                {"text": f"Age {_user_context['age']} is outside the validated range (60-94); norm classification omitted."},
+            ],
+            "component": [],
+        }
+    except Exception as e:
+        print(f"[server] FHIR observation build failed: {e}")
+        return None, None
+
+    _observation_store[sid] = sts_obs
+    return sts_obs, f"/share/{sid}"
+
+
 def _finalize_session() -> dict:
     """Finalize the current session: write the session row to BigQuery, call
     Gemini for a PT-facing progress report, then rotate to a fresh session.
@@ -422,11 +593,13 @@ def _finalize_session() -> dict:
         started_at = SESSION_STARTED_AT
         user_id = SESSION_USER_ID
         summaries = list(session_summaries)
+        notes = list(session_notes)
     if not summaries:
         _new_session()
         return {
             "session_id": sid, "sets_count": 0, "total_reps": 0,
             "report": None, "reason": "no sets in this session",
+            "patient_notes": [n["text"] for n in notes],
         }
 
     sets_count = len(summaries)
@@ -443,15 +616,22 @@ def _finalize_session() -> dict:
     )
     adherence_flag = "complete" if all_targets_hit else "partial"
 
+    active_profile = tracker.profile if tracker is not None else DEFAULT_PROFILE
+
+    # FHIR STS Observation for clinician handoff (None unless user-context set).
+    sts_obs, share_url = _build_sts_observation(
+        sid, user_id, started_at, summaries, total_reps, sets_count, active_profile
+    )
+
     # Write the session row (best-effort).
     bq.insert_session(
         session_id=sid, user_id=user_id, started_at=started_at,
         sets_count=sets_count, total_reps=total_reps,
         avg_depth=avg_depth, adherence_flag=adherence_flag,
+        sts_observation=sts_obs,
     )
 
     # Gemini progress report (gracefully degrades to None).
-    active_profile = tracker.profile if tracker is not None else DEFAULT_PROFILE
     report = ai_agent.generate_session_report(active_profile, summaries)
 
     # Rotate to a fresh session_id so subsequent sets start clean.
@@ -465,6 +645,9 @@ def _finalize_session() -> dict:
         "avg_depth": avg_depth,
         "adherence_flag": adherence_flag,
         "report": report,
+        "share_url": share_url,
+        "sts_observation": sts_obs,
+        "patient_notes": [n["text"] for n in notes],
     }
 
 
@@ -483,6 +666,52 @@ async def sets_recent(limit: int = 50):
     """
     rows = bq.query_recent_sets(limit=max(1, min(int(limit), 500)))
     return JSONResponse({"rows": rows, "bq_available": bq.is_available()})
+
+
+# ---------------------------------------------------------------------------
+# Clinician handoff: user context + FHIR Observation sharing.
+# ---------------------------------------------------------------------------
+class UserContext(BaseModel):
+    age: int
+    sex_at_birth: str  # "male" | "female"
+
+
+@app.post("/user-context")
+async def set_user_context(ctx: UserContext):
+    """Set age + biological sex for norm-stratified STS interpretation."""
+    global _user_context
+    if ctx.sex_at_birth not in ("male", "female"):
+        raise HTTPException(400, "sex_at_birth must be 'male' or 'female'")
+    if ctx.age < 1 or ctx.age > 120:
+        raise HTTPException(400, "age must be between 1 and 120")
+    _user_context = {"age": ctx.age, "sex_at_birth": ctx.sex_at_birth}
+    return JSONResponse({"status": "ok", "user_context": _user_context})
+
+
+@app.get("/user-context")
+async def get_user_context():
+    return JSONResponse({"user_context": _user_context})
+
+
+@app.get("/share/{session_id}")
+async def share_handoff_page(session_id: str):
+    """Serve the SPA shell; the frontend fetches the observation via the API."""
+    return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/api/share/{session_id}")
+async def share_handoff_api(session_id: str):
+    """Return the FHIR Observation for a session (in-memory store, then BQ)."""
+    obs = _observation_store.get(session_id)
+    if obs is None:
+        row = bq.query_session(session_id)
+        if row and row.get("sts_observation"):
+            obs = row["sts_observation"]
+    if obs is None:
+        raise HTTPException(404, "No observation found for this session. "
+                            "The session may not exist or tracking quality "
+                            "was insufficient.")
+    return JSONResponse({"session_id": session_id, "observation": obs})
 
 
 # ---------------------------------------------------------------------------
@@ -514,6 +743,7 @@ def _agent_context() -> dict:
         "current_reps": tracker.counter.rep_count if tracker is not None else 0,
         "sets_completed_this_session": sets_count,
         "sets_prescribed": prof.sets,
+        "patient_notes": [n["text"] for n in session_notes],
     }
     if last:
         depth = (last.get("analysis") or {}).get("depth") or {}
@@ -551,6 +781,15 @@ async def _handle_voice(text: str) -> None:
         tracker.start_set()
     elif action == "end_set":
         tracker.request_set_end()
+    elif action == "note":
+        # Record the patient's own words against the session for the PT handoff.
+        with _session_lock:
+            session_notes.append({
+                "text": text,
+                "at": datetime.now(timezone.utc).isoformat(),
+                "phase": tracker.phase if tracker is not None else None,
+            })
+        payload["note_count"] = len(session_notes)
     elif action == "next_set":
         tracker.reset_set()
         bridge.push_profile(tracker.profile, source=tracker.profile.source)
@@ -608,6 +847,11 @@ async def ws_endpoint(websocket: WebSocket):
                 tracker.reset_set(rep_target=int(target) if target else None)
                 # Profile may have been pending; broadcast the now-active one.
                 bridge.push_profile(tracker.profile, source=tracker.profile.source)
+            elif cmd == "set_imu" and tracker is not None:
+                # IMU sensor-fusion toggle from the check-in screen. When off the
+                # tracker is camera-only (occlusion -> "none"); when on the
+                # visibility-adaptive Kalman fusion drives the tracking-source panel.
+                tracker.set_imu_enabled(bool(msg.get("enabled", True)))
             elif cmd == "select_exercise" and tracker is not None:
                 # Switch the graded exercise (squat / push-up). Applied now if no
                 # set is in flight, else queued for the next set. The change shows

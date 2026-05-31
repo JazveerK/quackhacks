@@ -77,6 +77,24 @@ STALE_FRAME_SEC = 2.0           # seconds without a fresh camera frame -> error
 DEBOUNCE_FRAMES = 3             # consecutive frames past threshold to flip phase
 ANGLE_EMA_ALPHA = 0.30          # EMA smoothing for angle (0..1, higher = snappier)
 
+# --- Visibility-adaptive Kalman fusion (camera + IMU -> one fused angle). ---
+# This is the upgrade over the legacy "if visibility < threshold switch to IMU"
+# handoff below: a 1-D Kalman filter predicts with the IMU and corrects with the
+# camera, scaling the camera measurement noise R by visibility so the handoff is
+# continuous. It DEGRADES to the simple switch on any error (see _process_frame).
+# Q and R_base are the two knobs that need tuning on a real person.
+USE_KALMAN_FUSION = True        # master switch; False => legacy simple fusion only
+KALMAN_Q = 1.0                  # process noise: how much we trust the IMU predict/frame
+KALMAN_R_BASE = 3.0             # base camera measurement noise at full visibility
+KALMAN_VIS_FLOOR = 0.1          # clamp v away from 0 in R = R_base / v^2 (no div-by-0)
+KALMAN_K_IMU_THRESHOLD = 0.20   # Kalman gain below this => report tracking_source "imu"
+KALMAN_MAX_STEP_DEG = 45.0      # reject IMU predict steps larger than this (garbage guard)
+# Continuous blend weight emitted to the dashboard. This is the TRUTH the binary
+# tracking_source is only a label for: fusion_weight in [0,1], 1.0 = fully camera,
+# 0.0 = fully IMU. It's the Kalman gain K (or v^2 on the legacy simple path),
+# lightly EMA-smoothed so the dashboard's blend meter slides instead of jittering.
+FUSION_WEIGHT_EMA_ALPHA = 0.30  # smoothing on the emitted fusion_weight (0..1, snappier higher)
+
 # Set-lifecycle + gesture control.
 #
 # The set no longer auto-starts: the patient gets into position (guided by
@@ -94,15 +112,73 @@ GESTURE_CONFIRM_FRAMES = 6      # consecutive thumbs-up frames to START / advanc
 END_GESTURE_CONFIRM_FRAMES = 14 # stricter hold to END a live set (avoid accidents)
 GESTURE_COOLDOWN_SEC = 2.0      # ignore repeat gestures within this window
 
-# MediaPipe drawing styles. Cyan dots, lighter blue connections for visibility.
-import mediapipe.python.solutions.drawing_utils as _du
-_LANDMARK_STYLE = _du.DrawingSpec(color=(180, 255, 0), thickness=3, circle_radius=4)
-_CONNECTION_STYLE = _du.DrawingSpec(color=(255, 200, 80), thickness=2)
-
 # MediaPipe landmark indices (Pose).
 mp_pose = mp.solutions.pose
 mp_draw = mp.solutions.drawing_utils
 LM = mp_pose.PoseLandmark
+
+# ---- Skeleton overlay -----------------------------------------------------
+# We draw the skeleton ourselves rather than using mp_draw.draw_landmarks so we
+# can (a) drop the face landmarks (nose/eyes/ears/mouth — indices 0..10) the
+# dashboard doesn't want, and (b) colour the body by tracking confidence:
+# green when the camera is confidently locked on, red when it isn't yet.
+_FACE_LM_MAX = 10
+_BODY_CONNECTIONS = tuple(
+    (a, b) for (a, b) in mp_pose.POSE_CONNECTIONS
+    if a > _FACE_LM_MAX and b > _FACE_LM_MAX
+)
+_SKELETON_READY_BGR = (90, 210, 90)      # green
+_SKELETON_NOT_READY_BGR = (60, 60, 235)  # red
+
+
+def _draw_body_skeleton(frame, pose_landmarks, ready: bool) -> None:
+    """Overlay the body skeleton (no face) on `frame`.
+
+    Green when the camera is confidently tracking the leg, red when it isn't —
+    so the user can tell at a glance whether they're set up.
+    """
+    h, w = frame.shape[:2]
+    color = _SKELETON_READY_BGR if ready else _SKELETON_NOT_READY_BGR
+    lms = pose_landmarks.landmark
+
+    def px(i):
+        lm = lms[i]
+        if getattr(lm, "visibility", 1.0) < 0.5:
+            return None
+        return (int(lm.x * w), int(lm.y * h))
+
+    for a, b in _BODY_CONNECTIONS:
+        pa, pb = px(a), px(b)
+        if pa is None or pb is None:
+            continue
+        cv2.line(frame, pa, pb, color, 2, cv2.LINE_AA)
+
+    for i in range(_FACE_LM_MAX + 1, len(lms)):
+        p = px(i)
+        if p is None:
+            continue
+        cv2.circle(frame, p, 4, color, -1, cv2.LINE_AA)
+
+
+def _serialize_landmarks(landmarks) -> Optional[list]:
+    """Normalized 33-point landmarks as JSON-able [{x, y, z, visibility}, ...].
+
+    Emitted in the per-frame state so the dashboard's "get into position"
+    guide can overlay on the backend camera feed instead of opening a second
+    browser webcam. Returns None when there's no pose this frame.
+    """
+    if not landmarks:
+        return None
+    out = []
+    for lm in landmarks:
+        out.append({
+            "x": round(lm.x, 4),
+            "y": round(lm.y, 4),
+            "z": round(getattr(lm, "z", 0.0), 4),
+            "visibility": round(getattr(lm, "visibility", 0.0), 3),
+        })
+    return out
+
 
 # MediaPipe Hands — used only for the thumbs-up start/end/advance gesture.
 mp_hands = mp.solutions.hands
@@ -129,6 +205,117 @@ class MockIMU:
             "t": time.time() - self._t0,
             "quality": 0.95,
         }
+
+
+# ---------------------------------------------------------------------------
+# Visibility-adaptive 1-D Kalman fusion (the money-shot upgrade).
+# ---------------------------------------------------------------------------
+class KalmanAngleFilter:
+    """Fuse the IMU (prediction) and camera (measurement) into one joint angle.
+
+    State `x` is the joint (knee) angle in degrees; `P` is its variance. The IMU
+    integrates motion so it drives the PREDICT step; the camera is the absolute,
+    drift-free reference so it drives the UPDATE step.
+
+    The innovation is that the camera measurement noise scales with landmark
+    visibility v as ``R = R_base / v**2``. As the leg is occluded v -> 0, R
+    explodes, the Kalman gain K -> 0, and the estimate coasts on the IMU
+    prediction; as v recovers R shrinks and the camera re-anchors the estimate.
+    This replaces the discrete if-statement handoff with continuous math.
+
+    Equation reference (implemented verbatim):
+
+        PREDICT (per IMU motion):   x_pred = x_prev + omega*dt
+                                    P_pred = P_prev + Q
+        UPDATE  (per camera frame): R = R_base / v**2
+                                    K = P_pred / (P_pred + R)
+                                    x = x_pred + K*(z - x_pred)
+                                    P = (1 - K) * P_pred
+
+    `omega*dt` (the per-frame angular step) is taken as the change in the IMU's
+    own angle estimate between frames, so the full ~50 Hz gyro integration the
+    IMU already did is captured regardless of the camera frame rate.
+    """
+
+    def __init__(self, q: float = KALMAN_Q, r_base: float = KALMAN_R_BASE,
+                 vis_floor: float = KALMAN_VIS_FLOOR,
+                 k_imu_threshold: float = KALMAN_K_IMU_THRESHOLD,
+                 max_step_deg: float = KALMAN_MAX_STEP_DEG):
+        self.q = q
+        self.r_base = r_base
+        self.vis_floor = vis_floor
+        self.k_imu_threshold = k_imu_threshold
+        self.max_step_deg = max_step_deg
+        self.reset()
+
+    def reset(self) -> None:
+        self.x: Optional[float] = None   # fused angle (None until seeded)
+        self.P: float = 1.0              # estimate variance
+        self.K: float = 1.0              # last gain (drives tracking_source)
+        self._prev_imu: Optional[float] = None  # previous IMU angle, for the predict delta
+
+    @staticmethod
+    def _finite(v) -> bool:
+        return isinstance(v, (int, float)) and math.isfinite(v)
+
+    def step(self, cam_angle: Optional[float], imu_angle: Optional[float],
+             visibility: float):
+        """Run one predict + update cycle.
+
+        Parameters
+        ----------
+        cam_angle  : MediaPipe joint angle z (deg), or None if no pose this frame.
+        imu_angle  : IMU-derived joint angle (deg), or None if the IMU has no data.
+        visibility : camera landmark visibility v in [0, 1].
+
+        Returns
+        -------
+        (fused_angle, K) once seeded, else (None, None). Never raises on bad
+        input — non-finite values are simply ignored.
+        """
+        cam = cam_angle if self._finite(cam_angle) else None
+        imu = imu_angle if self._finite(imu_angle) else None
+
+        # --- Seed on the first usable sample (prefer the camera as the anchor).
+        if self.x is None:
+            seed = cam if cam is not None else imu
+            if seed is None:
+                return None, None
+            self.x = float(seed)
+            self.P = 1.0
+            self.K = 1.0 if cam is not None else 0.0
+            self._prev_imu = imu
+            return self.x, self.K
+
+        # --- PREDICT: advance by the IMU's change in angle (omega*dt).
+        if imu is not None and self._prev_imu is not None:
+            omega_dt = imu - self._prev_imu
+            # Reject implausible single-frame jumps (garbage IMU sample).
+            omega_dt = max(-self.max_step_deg, min(self.max_step_deg, omega_dt))
+        else:
+            omega_dt = 0.0
+        if imu is not None:
+            self._prev_imu = imu
+        x_pred = self.x + omega_dt
+        P_pred = self.P + self.q
+
+        # --- UPDATE: camera correction, weighted by visibility through R.
+        if cam is not None:
+            v = max(self.vis_floor, min(1.0, float(visibility)))
+            R = self.r_base / (v * v)
+            K = P_pred / (P_pred + R)
+            x = x_pred + K * (cam - x_pred)
+            P = (1.0 - K) * P_pred
+        else:
+            # No camera measurement: pure prediction, gain 0 (fully on the IMU).
+            K = 0.0
+            x = x_pred
+            P = P_pred
+
+        self.x = x
+        self.P = P
+        self.K = K
+        return self.x, self.K
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +483,10 @@ class RepCounter:
         self.rep_end_t: list[float] = []
         self.flag_counts: dict[str, int] = {r.name: 0 for r in spec.form_rules}
         self.voided_reps = 0
+        # Why the most-recent attempted-but-uncounted rep was rejected, so the
+        # coach can tell the patient ("that one didn't count — too shallow").
+        self.last_void_reason: Optional[str] = None
+        self.last_void_t: float = 0.0
         self._down_streak = 0
         self._up_streak = 0
         self._t_last_standing: float = 0.0
@@ -395,7 +586,19 @@ class RepCounter:
                     self.rep_flags.append(rep_flags)
                     flags = list(rep_flags)
                 else:
+                    # Attribute the rejection so the coach can explain it. Order
+                    # mirrors the validity gate above.
+                    if not (MIN_REP_SEC <= tempo <= MAX_REP_SEC):
+                        reason = "too_fast" if tempo < MIN_REP_SEC else "too_slow"
+                    elif cam_frac < MIN_CAM_FRAC:
+                        reason = "not_tracked"
+                    elif sgn * depth < sgn * self.count_depth_deg:
+                        reason = "shallow"
+                    else:
+                        reason = "incomplete"
                     self.voided_reps += 1
+                    self.last_void_reason = reason
+                    self.last_void_t = now
                 # Reset rep state regardless.
                 s.phase = "up"
                 s.min_angle_this_rep = self._extreme_init
@@ -479,6 +682,14 @@ class PoseTracker:
         exercise: Optional[str] = None,
     ):
         self.imu = imu_source or MockIMU()
+        # IMU fusion master toggle (flipped from the check-in screen). When off,
+        # the tracker is camera-only and falls back to "none" on occlusion.
+        self.imu_enabled = True
+        # Visibility-adaptive Kalman fuser + its degrade-to-simple latch. If the
+        # Kalman path ever errors, we drop to the legacy simple fusion for the
+        # rest of the session so the demo never loses tracking entirely.
+        self._kf = KalmanAngleFilter()
+        self._kalman_disabled = False
         self.on_state = on_state or (lambda s: None)
         self.on_set_end = on_set_end or (lambda summary: None)
         self.on_frame = on_frame or (lambda jpeg: None)
@@ -536,6 +747,8 @@ class PoseTracker:
         self._set_emitted = False
         self._smoothed_angle: Optional[float] = None
         self._last_source: Optional[str] = None
+        # EMA-smoothed continuous blend weight (Kalman gain). None until seeded.
+        self._fusion_weight: Optional[float] = None
 
         # Gesture + countdown state.
         self._start_requested = False          # external start (voice / button)
@@ -545,6 +758,10 @@ class PoseTracker:
         self._thumbs_up_now = False            # this frame's raw detection
         self._last_gesture_t = 0.0             # cooldown anchor
         self._countdown_start: Optional[float] = None
+
+        # Latest normalized landmarks, forwarded in the state so the dashboard
+        # setup guide can overlay on the backend feed (no second webcam).
+        self._last_landmarks: Optional[list] = None
 
         # Setup-status tracking.
         self._last_pose_t: Optional[float] = None
@@ -561,6 +778,18 @@ class PoseTracker:
         self._occlusion_events = 0
 
     # ----- external control (manual buttons / voice from UI) -----
+    def set_imu_enabled(self, enabled: bool) -> None:
+        """Toggle IMU sensor fusion on/off (from the check-in screen).
+
+        When disabled the tracker is camera-only: occlusion drops tracking to
+        "none" instead of handing off to the IMU. Re-enabling reseeds the
+        Kalman filter so a stale prediction can't leak in.
+        """
+        enabled = bool(enabled)
+        if enabled and not self.imu_enabled:
+            self._kf.reset()
+        self.imu_enabled = enabled
+
     def request_set_end(self) -> None:
         self._set_end_requested = True
 
@@ -718,6 +947,8 @@ class PoseTracker:
         self._set_emitted = False
         self._smoothed_angle = None
         self._last_source = None
+        self._fusion_weight = None
+        self._kf.reset()
         self._set_start_t = None
         self._cam_frame_count = 0
         self._imu_frame_count = 0
@@ -892,6 +1123,25 @@ class PoseTracker:
             "ok": True, "severity": "good", "code": "ok",
             "hint": "Tracking — go.",
         }
+
+    @staticmethod
+    def _fusion_weight_from_visibility(
+        leg_vis: float, imu_on: bool, has_signal: bool
+    ) -> Optional[float]:
+        """Continuous camera/IMU blend weight in [0,1] for the dashboard.
+
+        1.0 = fully camera, 0.0 = fully IMU. This is the visibility-adaptive
+        camera-trust term v^2 — the same factor that scales the Kalman measurement
+        noise R = R_base / v^2 — so the emitted weight and the fuser's internal
+        weighting tell the same story. Both sensors always contribute; the weight
+        just shifts. Returns None when there's no usable signal, and 1.0 (camera
+        only) when the IMU is off for this set/exercise.
+        """
+        if not has_signal:
+            return None
+        if not imu_on:
+            return 1.0
+        return max(0.0, min(1.0, leg_vis * leg_vis))
 
     def _depth_state(self, angle: float) -> str:
         # Direction-aware via sgn: "below_parallel" = reached target (good),
@@ -1391,8 +1641,10 @@ class PoseTracker:
         cam_angle: Optional[float] = None
         landmarks = None
         joint_pts: Optional[tuple] = None
+        self._last_landmarks = None
         if result.pose_landmarks:
             landmarks = result.pose_landmarks.landmark
+            self._last_landmarks = _serialize_landmarks(landmarks)
             self._last_pose_t = now
             leg_vis, leg_vis_min, ja, jb, jc = self._extract_limb(landmarks)
             joint_pts = (ja, jb, jc)
@@ -1400,23 +1652,17 @@ class PoseTracker:
             b_px = (jb[0] * w, jb[1] * h)
             c_px = (jc[0] * w, jc[1] * h)
             cam_angle = angle_deg(a_px, b_px, c_px)
-            # Always overlay the skeleton — the dashboard renders this JPEG.
-            mp_draw.draw_landmarks(
-                frame,
-                result.pose_landmarks,
-                mp_pose.POSE_CONNECTIONS,
-                landmark_drawing_spec=_LANDMARK_STYLE,
-                connection_drawing_spec=_CONNECTION_STYLE,
-            )
 
         imu_sample = self.imu.get_latest() or {}
         imu_quality = float(imu_sample.get("quality", 0.0))
-        # IMU fusion only applies to exercises whose spec opts in (the squat's
-        # thigh tilt). For others the IMU mapping isn't meaningful, so we stay on
-        # camera and fall back to "none" on occlusion.
+        # IMU fusion only applies when (a) the user left the IMU toggle on AND
+        # (b) this exercise's spec opts in (the squat's thigh tilt). Otherwise
+        # the tilt->angle mapping isn't meaningful, so we stay camera-only and
+        # fall back to "none" on occlusion.
+        imu_on = self.imu_enabled and self.exercise_spec.use_imu_fusion
         imu_angle = (
             imu_tilt_to_knee_angle(float(imu_sample.get("tilt", 0.0)))
-            if imu_sample and self.exercise_spec.use_imu_fusion else None
+            if (imu_on and imu_sample) else None
         )
 
         camera_trusted = (
@@ -1425,6 +1671,11 @@ class PoseTracker:
             and leg_vis_min >= LANDMARK_VIS_FLOOR
         )
 
+        # Overlay the body skeleton (no face) on the JPEG the dashboard renders,
+        # green once the camera is confidently tracking and red until then.
+        if result.pose_landmarks is not None:
+            _draw_body_skeleton(frame, result.pose_landmarks, camera_trusted)
+
         # ---- Setup status (camera framing / no-person feedback) ----
         setup_status = self._classify_setup(
             landmarks, leg_vis, leg_vis_min, camera_trusted, now,
@@ -1432,45 +1683,73 @@ class PoseTracker:
         )
         self._last_setup = setup_status
 
-        # ---- FUSION: trust camera only when leg landmarks are solidly visible.
-        if camera_trusted:
-            raw_angle = cam_angle
-            tracking_source = "camera"
-        elif imu_angle is not None:
-            raw_angle = imu_angle
-            tracking_source = "imu"
-        elif cam_angle is not None:
-            raw_angle = cam_angle
-            tracking_source = "camera"
-        else:
-            # Nothing usable — still emit a state so the UI can show the hint.
-            self._emit_state(
-                angle=None, tracking_source="none",
-                leg_vis=leg_vis, imu_quality=imu_quality,
-                active_flags=[], setup_status=setup_status,
-            )
-            return
+        # ---- FUSION ------------------------------------------------------
+        # Preferred path: the visibility-adaptive Kalman filter fuses the camera
+        # measurement and the IMU prediction into one angle, and derives the
+        # tracking source from the Kalman gain (small gain => leaning on the IMU
+        # => "imu"). It DEGRADES to the legacy simple switch on any error, and is
+        # bypassed entirely when the IMU is off for this set/exercise.
+        angle: Optional[float] = None
+        tracking_source = "none"
+        if USE_KALMAN_FUSION and imu_on and not self._kalman_disabled:
+            try:
+                fused, K = self._kf.step(cam_angle, imu_angle, leg_vis)
+                if fused is not None:
+                    angle = max(0.0, min(180.0, fused))
+                    tracking_source = (
+                        "imu" if (K is not None and K < KALMAN_K_IMU_THRESHOLD)
+                        else "camera"
+                    )
+            except Exception as e:
+                print(f"[pose_tracker] Kalman fusion error, using simple path: {e}")
+                self._kalman_disabled = True
 
-        # Aggregate source frame counts + count handoff events.
+        if tracking_source == "none":
+            # ---- Legacy simple fusion (the TESTED fallback). -------------
+            # Trust the camera only when leg landmarks are solidly visible; else
+            # hand off to the IMU; else degrade to whatever camera angle exists.
+            if camera_trusted:
+                raw_angle = cam_angle
+                tracking_source = "camera"
+            elif imu_angle is not None:
+                raw_angle = imu_angle
+                tracking_source = "imu"
+            elif cam_angle is not None:
+                raw_angle = cam_angle
+                tracking_source = "camera"
+            else:
+                # Nothing usable — still emit a state so the UI can show the hint.
+                self._fusion_weight = None
+                self._emit_state(
+                    angle=None, tracking_source="none", fusion_weight=None,
+                    leg_vis=leg_vis, imu_quality=imu_quality,
+                    active_flags=[], setup_status=setup_status,
+                )
+                return
+            # EMA smoothing damps single-frame noise; reset on a source switch so
+            # the handoff doesn't leak a giant step into the state machine. (The
+            # Kalman output above is already smooth, so it skips this.)
+            if self._last_source != tracking_source or self._smoothed_angle is None:
+                self._smoothed_angle = raw_angle
+            else:
+                self._smoothed_angle = (
+                    ANGLE_EMA_ALPHA * raw_angle
+                    + (1.0 - ANGLE_EMA_ALPHA) * self._smoothed_angle
+                )
+            angle = self._smoothed_angle
+
+        # ---- Shared bookkeeping: source frame counts, handoff events. ----
         if tracking_source == "camera":
             self._cam_frame_count += 1
         else:
             self._imu_frame_count += 1
         if self._last_source == "camera" and tracking_source == "imu":
             self._occlusion_events += 1
-
-        # EMA smoothing damps single-frame noise. Reset on source switch so the
-        # IMU<->camera handoff doesn't leak a giant step into the state machine.
-        if self._last_source != tracking_source or self._smoothed_angle is None:
-            self._smoothed_angle = raw_angle
+        # On any source handoff, pause the rep streaks so the switch can't leak a
+        # giant single-frame step into the rep state machine.
+        if self._last_source != tracking_source:
             self.counter.pause_streaks()
-        else:
-            self._smoothed_angle = (
-                ANGLE_EMA_ALPHA * raw_angle
-                + (1.0 - ANGLE_EMA_ALPHA) * self._smoothed_angle
-            )
         self._last_source = tracking_source
-        angle = self._smoothed_angle
 
         # ---- Lifecycle transitions (gesture / countdown / external) ----
         countdown_remaining: Optional[float] = None
@@ -1536,8 +1815,32 @@ class PoseTracker:
             if self._check_set_end(angle, now):
                 self.phase = "SET_END"
 
+        # ---- Continuous blend weight (EMA-smoothed) for the dashboard. ----
+        # fusion_weight in [0,1]: 1.0 = fully camera, 0.0 = fully IMU. This is the
+        # CONTINUOUS truth the binary tracking_source is only a label for. It's the
+        # visibility-adaptive camera-trust term v^2 — exactly what scales the Kalman
+        # measurement noise R = R_base / v^2 — so it spans the full range (≈0.9 at
+        # full visibility, →0 under occlusion) and both sensors always contribute.
+        # Camera-only (w=1) when the IMU is off for this set/exercise. EMA keeps the
+        # meter sliding instead of snapping.
+        raw_w = self._fusion_weight_from_visibility(
+            leg_vis, imu_on, has_signal=angle is not None
+        )
+        if raw_w is None:
+            self._fusion_weight = None
+            fusion_weight = None
+        else:
+            if self._fusion_weight is None:
+                self._fusion_weight = raw_w
+            else:
+                self._fusion_weight = (
+                    FUSION_WEIGHT_EMA_ALPHA * raw_w
+                    + (1.0 - FUSION_WEIGHT_EMA_ALPHA) * self._fusion_weight
+                )
+            fusion_weight = self._fusion_weight
+
         self._emit_state(
-            angle=angle, tracking_source=tracking_source,
+            angle=angle, tracking_source=tracking_source, fusion_weight=fusion_weight,
             leg_vis=leg_vis, imu_quality=imu_quality,
             active_flags=active_flags, setup_status=setup_status,
             countdown=countdown_remaining,
@@ -1587,6 +1890,7 @@ class PoseTracker:
         self, *, angle: Optional[float], tracking_source: str,
         leg_vis: float, imu_quality: float,
         active_flags: list[str], setup_status: dict,
+        fusion_weight: Optional[float] = None,
         countdown: Optional[float] = None,
     ) -> None:
         # depth_state derived from current rep min if descending, else live angle.
@@ -1615,8 +1919,22 @@ class PoseTracker:
             "tempo": self.counter.last_tempo(),
             "imu_quality": round(imu_quality, 2),
             "landmark_visibility": round(leg_vis, 2),
+            # Normalized 33-point landmarks for the dashboard setup guide to
+            # overlay on the backend feed. None when no pose this frame.
+            "pose_landmarks": self._last_landmarks,
             "tracking_source": tracking_source,
+            # Continuous sensor-fusion blend weight in [0,1]: 1.0 = fully camera,
+            # 0.0 = fully IMU. This is the real mechanism; tracking_source above is
+            # only a derived label. None when there's no usable signal this frame.
+            "fusion_weight": (round(fusion_weight, 3)
+                              if fusion_weight is not None else None),
             "rep_depths": list(self.counter.rep_depths),
+            # IMU master toggle, so the dashboard can hide IMU UI when it's off.
+            "imu_enabled": bool(self.imu_enabled),
+            # Edge-triggered "rep didn't count" signal: the dashboard watches
+            # rep_void_count and, when it climbs, voices rep_void_reason.
+            "rep_void_count": self.counter.voided_reps,
+            "rep_void_reason": self.counter.last_void_reason,
             "setup_status": setup_status,
             # A start is queued but held until the camera angle is confirmed.
             "start_pending": bool(self._start_requested),

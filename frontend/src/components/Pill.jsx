@@ -6,7 +6,7 @@ const styles = {
 
 export default function Pill({ variant = "brand", children, className = "" }) {
   return (
-    <span className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium ${styles[variant]} ${className}`}>
+    <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-lg text-[12px] font-medium ${styles[variant]} ${className}`}>
       {children}
     </span>
   )
