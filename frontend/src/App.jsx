@@ -1,117 +1,67 @@
-import { useEffect, useState } from 'react'
-import useSocket from './hooks/useSocket'
-import useVoice from './hooks/useVoice'
-import AppHeader from './components/AppHeader'
-import LiveSession from './components/LiveSession'
-import DebriefScreen from './components/DebriefScreen'
-import SessionReport from './components/SessionReport'
+import { useState } from "react"
+import AppHeader from "./components/AppHeader"
+import CoachChat from "./components/CoachChat"
+import CheckIn from "./screens/CheckIn"
+import LiveDashboard from "./screens/LiveDashboard"
+import Debrief from "./screens/Debrief"
+import ClinicianView from "./screens/ClinicianView"
+
+const SCREENS = [
+  { key: "checkin",   label: "1 · Check-in" },
+  { key: "live",      label: "2 · Live" },
+  { key: "debrief",   label: "3 · Debrief" },
+  { key: "clinician", label: "4 · Clinician (PT)" },
+]
+
+const phaseForScreen = {
+  checkin:   { phase: "Check-in",   color: "blue" },
+  live:      { phase: "Active",     color: "green" },
+  debrief:   { phase: "Debrief",    color: "blue" },
+  clinician: { phase: "Clinician",  color: "blue" },
+}
 
 export default function App() {
-  const {
-    connected, state, frame, summary, aiDebrief, profile, agentReply,
-    send, setSummary, setAgentReply,
-  } = useSocket()
-  const voice = useVoice(send)
-
-  const [sessionReport, setSessionReport] = useState(null)
-  const [setsCompleted, setSetsCompleted] = useState(0)
-
-  const activeProfile = state?.profile || profile
-  const phase = state?.phase || 'WAITING_FOR_START'
-
-  // Completed-set count comes from each set summary (set_index is 1-based).
-  useEffect(() => {
-    if (summary?.set_index != null) setSetsCompleted(summary.set_index)
-  }, [summary])
-
-  // React to every voice-agent reply: speak it, and surface the session report
-  // when the agent ends the session by voice.
-  useEffect(() => {
-    if (!agentReply) return
-    if (agentReply.text) voice.speak(agentReply.text)
-    if (agentReply.action === 'end_session' && agentReply.report) {
-      setSessionReport(agentReply.report)
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [agentReply?.seq])
-
-  function handleStartSet() {
-    send({ cmd: 'start_set' })
-  }
-  function handleEndSet() {
-    send({ cmd: 'end_set' })
-  }
-  function handleSelectExercise(id) {
-    send({ cmd: 'select_exercise', id })
-  }
-  function handleStartNext() {
-    send({ cmd: 'reset_set' })
-    setSummary(null)
-  }
-  async function handleEndSession() {
-    let report = null
-    try {
-      const res = await fetch('/session/end', { method: 'POST' })
-      if (res.ok) report = await res.json()
-    } catch { /* fall back to a minimal local summary */ }
-    setSessionReport(report || { sets_count: setsCompleted, total_reps: 0, report: null })
-  }
-  function handleCloseReport() {
-    setSessionReport(null)
-    setSummary(null)
-    setAgentReply(null)
-    setSetsCompleted(0)
-    send({ cmd: 'reset_set' })
-  }
-
-  // Routing priority: session report > per-set debrief > live session.
-  const showDebrief = summary != null && (phase === 'DEBRIEF' || phase === 'SET_END')
-  const totalSets = activeProfile?.sets || 3
-  const headerSet = Math.min(
-    showDebrief ? setsCompleted : setsCompleted + 1,
-    totalSets,
-  ) || 1
-
-  let page
-  if (sessionReport) {
-    page = <SessionReport report={sessionReport} onClose={handleCloseReport} />
-  } else if (showDebrief) {
-    page = (
-      <DebriefScreen
-        summary={summary}
-        aiDebrief={aiDebrief}
-        profile={activeProfile}
-        setsCompleted={setsCompleted}
-        totalSets={totalSets}
-        onStartNext={handleStartNext}
-        onEndSession={handleEndSession}
-      />
-    )
-  } else {
-    page = (
-      <LiveSession
-        state={state}
-        frame={frame}
-        profile={activeProfile}
-        voice={voice}
-        lastReply={agentReply}
-        onStartSet={handleStartSet}
-        onEndSet={handleEndSet}
-        onSelectExercise={handleSelectExercise}
-      />
-    )
-  }
+  const [screen, setScreen] = useState("checkin")
+  const { phase, color } = phaseForScreen[screen]
 
   return (
-    <div className="flex flex-col h-screen">
+    <div className="flex flex-col h-full">
       <AppHeader
-        connected={connected}
-        state={state}
-        profile={activeProfile}
-        currentSet={headerSet}
-        totalSets={totalSets}
+        context={["Bodyweight Squat"]}
+        phase={phase}
+        phaseColor={color}
       />
-      {page}
+
+      {/* Dev nav — segmented control */}
+      <nav className="flex justify-center py-3 shrink-0">
+        <div className="inline-flex bg-surface rounded-full p-1 gap-0.5">
+          {SCREENS.map(({ key, label }) => (
+            <button
+              key={key}
+              type="button"
+              onClick={() => setScreen(key)}
+              className={`px-4 py-1.5 rounded-full text-xs font-medium transition-colors ${
+                screen === key
+                  ? "bg-white text-brand shadow-sm"
+                  : "text-ink-soft hover:text-ink"
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      </nav>
+
+      {/* Screen content */}
+      <main className="flex-1 w-full max-w-5xl mx-auto px-4 pb-6">
+        {screen === "checkin"   && <CheckIn setScreen={setScreen} />}
+        {screen === "live"      && <LiveDashboard setScreen={setScreen} />}
+        {screen === "debrief"   && <Debrief setScreen={setScreen} />}
+        {screen === "clinician" && <ClinicianView setScreen={setScreen} />}
+      </main>
+
+      {/* Floating coach chat — available on all screens */}
+      <CoachChat />
     </div>
   )
 }

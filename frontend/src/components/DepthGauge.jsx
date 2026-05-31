@@ -1,28 +1,17 @@
 export default function DepthGauge({ state, profile }) {
   const angle = state?.angle ?? 180
   const depthState = state?.depth_state || 'shallow'
-  const ex = state?.exercise_ui
-  const targetDeg = state?.target_depth_deg ?? profile?.depth_deg ?? 95
-  const rom = ex?.rom_metric || 'min'
+  const targetDeg = profile?.depth_deg ?? 95
 
-  // Arc gauge: 0% = resting, 100% = full range. Range + direction come from the
-  // active exercise: "min" fills as the angle shrinks (squat), "max" fills as it
-  // grows (arm raise).
-  const A_MIN = ex?.gauge_min_deg ?? 60
-  const A_MAX = ex?.gauge_max_deg ?? 180
-  const fill = (a) => {
-    const r = (A_MAX - a) / (A_MAX - A_MIN)
-    return Math.max(0, Math.min(1, rom === 'max' ? 1 - r : r))
-  }
-  const pct = fill(angle)
-  const targetPct = fill(targetDeg)
+  const A_MIN = 60
+  const A_MAX = 180
+  const pct = Math.max(0, Math.min(1, (A_MAX - angle) / (A_MAX - A_MIN)))
+  const targetPct = Math.max(0, Math.min(1, (A_MAX - targetDeg) / (A_MAX - A_MIN)))
 
-  // SVG half-circle arc
   const R = 60
   const CX = 70
   const CY = 70
-  const startAngle = Math.PI // left
-  const endAngle = 0 // right
+  const startAngle = Math.PI
 
   function arcPoint(frac) {
     const a = startAngle - frac * Math.PI
@@ -45,16 +34,16 @@ export default function DepthGauge({ state, profile }) {
   }[depthState] || depthState
 
   const badgeClass = {
-    below_parallel: 'bg-success-fill text-success-text',
-    at_parallel: 'bg-info-fill text-info-text',
-    shallow: 'bg-warning-fill text-warning-text',
-  }[depthState] || 'bg-surface text-secondary-text'
+    below_parallel: 'bg-ok-bg text-ok',
+    at_parallel: 'bg-brand-bg text-brand',
+    shallow: 'bg-warn-bg text-warn',
+  }[depthState] || 'bg-surface text-ink-soft'
 
   return (
-    <div className="bg-surface-white rounded-xl border border-border p-4">
-      <div className="text-[10px] text-tertiary-text tracking-wide mb-1">{ex?.depth_label || 'Depth'}</div>
+    <div className="bg-white rounded-lg border border-hair p-4">
+      <div className="text-[10px] text-ink-faint tracking-wide mb-1">Knee depth</div>
       <div className="flex items-center gap-3 mb-2">
-        <span className="text-[26px] font-medium text-primary-text tabular-nums leading-none">
+        <span className="text-[26px] font-medium text-ink tabular-nums leading-none">
           {angle > 0 ? Math.round(angle) : '--'}
         </span>
         <span className={`text-[10px] px-2 py-0.5 rounded-full ${badgeClass}`}>
@@ -63,20 +52,17 @@ export default function DepthGauge({ state, profile }) {
       </div>
 
       <svg viewBox="0 0 140 80" className="w-full max-w-[200px] mx-auto">
-        {/* Track */}
         <path d={arcPath(0, 1)} fill="none" stroke="var(--color-surface)" strokeWidth="8" strokeLinecap="round" />
-        {/* Fill */}
         {pct > 0.01 && (
           <path
             d={arcPath(0, pct)}
             fill="none"
-            stroke={depthState === 'shallow' ? 'var(--color-warning)' : 'var(--color-success)'}
+            stroke={depthState === 'shallow' ? 'var(--color-warn)' : 'var(--color-ok)'}
             strokeWidth="8"
             strokeLinecap="round"
           />
         )}
-        {/* Target marker */}
-        <circle cx={tx} cy={ty} r="4" fill="var(--color-success)" stroke="white" strokeWidth="2" />
+        <circle cx={tx} cy={ty} r="4" fill="var(--color-ok)" stroke="white" strokeWidth="2" />
       </svg>
     </div>
   )

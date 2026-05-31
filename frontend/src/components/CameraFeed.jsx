@@ -12,7 +12,7 @@ export default function CameraFeed({ frame, state }) {
   }, [frame])
 
   return (
-    <div className="relative bg-[#1a1a1a] rounded-xl overflow-hidden flex items-center justify-center min-h-0 w-full h-full">
+    <div className="relative bg-[#1a1a1a] rounded-xl overflow-hidden flex items-center justify-center min-h-0">
       {frame ? (
         <img
           ref={imgRef}
@@ -20,7 +20,7 @@ export default function CameraFeed({ frame, state }) {
           className="w-full h-full object-contain"
         />
       ) : (
-        <div className="text-tertiary-text text-sm">Waiting for camera...</div>
+        <div className="text-ink-faint text-sm">Waiting for camera...</div>
       )}
 
       {/* Top-left label */}

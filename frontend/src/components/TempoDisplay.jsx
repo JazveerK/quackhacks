@@ -1,6 +1,6 @@
 export default function TempoDisplay({ state }) {
   const tempo = state?.tempo ?? 0
-  const targetTempo = 3.0 // from profile, TODO: wire
+  const targetTempo = 3.0
   const hasData = tempo > 0
 
   let label = 'Waiting...'
@@ -11,15 +11,15 @@ export default function TempoDisplay({ state }) {
   }
 
   return (
-    <div className="bg-surface-white rounded-xl border border-border p-4">
-      <div className="text-[10px] text-tertiary-text tracking-wide mb-1">Descent tempo</div>
+    <div className="bg-white rounded-lg border border-hair p-4">
+      <div className="text-[10px] text-ink-faint tracking-wide mb-1">Descent tempo</div>
       <div className="flex items-baseline gap-1.5">
-        <span className="text-[22px] font-medium text-primary-text tabular-nums leading-none">
+        <span className="text-[22px] font-medium text-ink tabular-nums leading-none">
           {hasData ? tempo.toFixed(1) : '--'}
         </span>
-        <span className="text-xs text-tertiary-text">sec</span>
+        <span className="text-xs text-ink-faint">sec</span>
       </div>
-      <div className="text-[11px] text-secondary-text mt-1">{label}</div>
+      <div className="text-[11px] text-ink-soft mt-1">{label}</div>
     </div>
   )
 }
