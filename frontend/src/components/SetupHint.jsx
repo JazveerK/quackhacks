@@ -3,13 +3,13 @@ export default function SetupHint({ state }) {
   if (!setup || setup.severity === 'good') return null
 
   const styles = {
-    info: 'bg-surface text-tertiary-text',
-    warning: 'bg-warning-fill text-warning-text border border-warning/20',
-    blocking: 'bg-warning-fill text-warning-text border border-warning/30',
+    info: 'bg-surface text-ink-faint',
+    warning: 'bg-warn-bg text-warn border border-warn/20',
+    blocking: 'bg-warn-bg text-warn border border-warn/30',
   }
 
   return (
-    <div className={`rounded-xl p-3 text-xs ${styles[setup.severity] || styles.info}`}>
+    <div className={`rounded-lg p-3 text-xs ${styles[setup.severity] || styles.info}`}>
       {setup.hint}
     </div>
   )

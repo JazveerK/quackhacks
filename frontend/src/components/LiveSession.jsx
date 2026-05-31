@@ -11,10 +11,8 @@ export default function LiveSession({ state, frame, profile, onEndSet, onStartNe
   return (
     <div className="flex-1 flex flex-col min-h-0">
       <div className="flex-1 grid grid-cols-[1fr_280px_170px] gap-3 p-3 min-h-0">
-        {/* Camera column (60%) */}
         <CameraFeed frame={frame} state={state} />
 
-        {/* Metrics column (25%) */}
         <div className="flex flex-col gap-3 min-h-0 overflow-y-auto">
           <RepCounter state={state} />
           <DepthGauge state={state} profile={profile} />
@@ -23,21 +21,19 @@ export default function LiveSession({ state, frame, profile, onEndSet, onStartNe
           <SetupHint state={state} />
         </div>
 
-        {/* Sidebar column (15%) */}
         <div className="flex flex-col gap-3 min-h-0">
           <TrackingSource state={state} />
 
-          {/* Controls */}
           <div className="mt-auto flex flex-col gap-2">
             <button
               onClick={onEndSet}
-              className="w-full text-xs border border-border rounded-lg px-3 py-2 text-secondary-text hover:bg-surface transition-colors"
+              className="w-full text-xs border border-hair rounded-lg px-3 py-2 text-ink-soft hover:bg-surface transition-colors"
             >
               End set
             </button>
             <button
               onClick={onStartNext}
-              className="w-full text-xs bg-info text-white rounded-lg px-3 py-2 font-medium hover:opacity-90 transition-opacity"
+              className="w-full text-xs bg-brand text-white rounded-lg px-3 py-2 font-medium hover:opacity-90 transition-opacity"
             >
               Next set
             </button>

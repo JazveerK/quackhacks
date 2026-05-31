@@ -33,6 +33,8 @@ from pose_tracker import PoseTracker, MockIMU
 from profile import PTProfile, DEFAULT_PROFILE
 import ai_agent
 import bq
+from coach_voice import router as coach_router
+from coach_chat import router as chat_router
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -230,6 +232,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+app.include_router(coach_router)
+app.include_router(chat_router)
 
 
 @app.get("/")

@@ -20,7 +20,7 @@ export default function CameraFeed({ frame, state }) {
           className="w-full h-full object-contain"
         />
       ) : (
-        <div className="text-tertiary-text text-sm">Waiting for camera...</div>
+        <div className="text-ink-faint text-sm">Waiting for camera...</div>
       )}
 
       {/* Top-left label */}
