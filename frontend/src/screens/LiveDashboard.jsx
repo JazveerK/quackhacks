@@ -1,142 +1,192 @@
-import { useRef } from "react"
+import { useState } from "react"
 import { useMockSession } from "../mockSession"
-import AppHeader from "../components/AppHeader"
-import GhostButton from "../components/GhostButton"
 import CameraPanel from "../components/CameraPanel"
 import RepCounter from "../components/RepCounter"
-import DepthGauge from "../components/DepthGauge"
 import TrackingSource from "../components/TrackingSource"
+import FormCueBanner from "../components/FormCueBanner"
 import Pill from "../components/Pill"
-
-const CUES = [
-  "Good depth — control the way up",
-  "Nice control — three more",
-  "Take your time on the way down",
-  "Good — last one",
-  "Steady through the bottom",
-]
+import SetupPoseGuide from "./SetupPoseGuide"
 
 export default function LiveDashboard({ setScreen }) {
   const { state } = useMockSession()
-  const lastRepRef = useRef(0)
-  const cueIndexRef = useRef(0)
+  const [setupDone, setSetupDone] = useState(false)
 
   if (!state) {
     return (
-      <div className="flex-1 flex items-center justify-center text-ink-soft text-sm">
-        Connecting…
+      <div className="flex-1 flex items-center justify-center text-ink-soft text-[15px]">
+        <div className="flex flex-col items-center gap-3">
+          <div className="w-10 h-10 rounded-2xl bg-surface flex items-center justify-center">
+            <i className="ti ti-loader-2 text-ink-faint text-xl animate-spin" />
+          </div>
+          Connecting…
+        </div>
       </div>
     )
   }
 
-  // Advance cue when rep_count increments
-  if (state.rep_count > lastRepRef.current && state.rep_count > 0) {
-    cueIndexRef.current = (state.rep_count - 1) % CUES.length
-    lastRepRef.current = state.rep_count
+  const target = state.personal_target_depth_deg ?? 95
+
+  // Show setup pose guide before the active set
+  if (!setupDone && state.phase === "SET_ACTIVE" && state.rep_count === 0) {
+    return (
+      <div className="flex flex-col h-full p-4">
+        <SetupPoseGuide
+          personalTargetDepthDeg={target}
+          onConfirmed={() => setSetupDone(true)}
+          onSkip={() => setSetupDone(true)}
+          backendLandmarks={state.pose_landmarks ?? null}
+          backendFrame={null}
+        />
+      </div>
+    )
   }
-  const cue = state.rep_count > 0 ? CUES[cueIndexRef.current] : null
 
   const angle = state.angle ?? 180
-  const target = state.personal_target_depth_deg ?? 95
   const tempo = state.tempo ?? 0
   const imuQ = state.imu_quality ?? 0
   const vis = state.landmark_visibility ?? 0
 
-  // Depth status
-  let depthLabel, depthVariant
+  // Depth status — icon + text + color (triple redundancy)
+  let depthLabel, depthVariant, depthIcon
   if (angle <= target + 5) {
     depthLabel = "At target"
     depthVariant = "ok"
+    depthIcon = "ti-check"
   } else if (angle <= target + 20) {
     depthLabel = "Approaching"
-    depthVariant = "warn"
+    depthVariant = "brand"
+    depthIcon = "ti-arrow-down"
   } else {
     depthLabel = "Above target"
-    depthVariant = "brand"
+    depthVariant = "warn"
+    depthIcon = "ti-arrow-up"
+  }
+
+  // Tempo assessment
+  const targetTempo = 3.0
+  let tempoLabel = "Waiting…"
+  if (tempo > 0) {
+    if (Math.abs(tempo - targetTempo) < 0.5) tempoLabel = "Steady · within range"
+    else if (tempo < targetTempo) tempoLabel = "A bit fast"
+    else tempoLabel = "Nice and slow"
   }
 
   return (
     <div className="flex flex-col h-full">
-      {/* Header */}
-      <AppHeader
-        context={["Bodyweight squat", "Set 2 of 3"]}
-        phase="Set active"
-        phaseColor="green"
-      >
-        <GhostButton onClick={() => setScreen("debrief")}>
-          <i className="ti ti-player-stop text-sm" />
-          End set
-        </GhostButton>
-      </AppHeader>
+      {/* 3-column grid — camera hero (60%), metrics (25%), sidebar (15%) */}
+      <div className="flex-1 grid grid-cols-[3fr_1.25fr_0.75fr] gap-3 p-3 min-h-0
+                       max-[1023px]:grid-cols-[3fr_1.5fr] max-[767px]:grid-cols-1">
 
-      {/* 3-column grid */}
-      <div className="flex-1 grid grid-cols-[3fr_1.25fr_0.75fr] gap-3 p-3 min-h-0">
-        {/* Camera (60%) */}
-        <CameraPanel frame={null} />
+        {/* Camera (hero) with per-rep bar overlay */}
+        <CameraPanel
+          frame={null}
+          repDepths={state.rep_depths}
+          targetDeg={target}
+          landmarks={state.pose_landmarks}
+        />
 
-        {/* Metrics (25%) */}
+        {/* Metrics column */}
         <div className="flex flex-col gap-3 min-h-0 overflow-y-auto">
           <RepCounter state={state} />
 
-          {/* Knee depth — inline version with arc gauge */}
-          <div className="bg-white rounded-lg border border-hair p-4">
-            <div className="text-[10px] text-ink-faint tracking-wide mb-1">Knee depth</div>
-            <div className="flex items-center gap-2 mb-2">
-              <span className="text-[26px] font-medium text-ink tabular-nums leading-none">
-                {Math.round(angle)}°
+          {/* Knee depth with arc gauge */}
+          <div
+            className="bg-white rounded-2xl p-5"
+            aria-label={`Knee depth ${Math.round(angle)} degrees, ${depthLabel}`}
+          >
+            <div className="text-[12px] text-ink-faint font-medium uppercase tracking-wide mb-2">Knee depth</div>
+            <div className="flex items-center gap-2.5 mb-3">
+              <span className="text-[28px] font-semibold text-ink tabular-nums leading-none tracking-tight">
+                {angle > 0 ? Math.round(angle) : "—"}°
               </span>
-              <Pill variant={depthVariant}>{depthLabel}</Pill>
+              <Pill variant={depthVariant}>
+                <i className={`ti ${depthIcon} text-[11px]`} />
+                {depthLabel}
+              </Pill>
             </div>
             <DepthArc angle={angle} target={target} depthVariant={depthVariant} />
           </div>
 
           {/* Descent tempo */}
-          <div className="bg-white rounded-lg border border-hair p-4">
-            <div className="text-[10px] text-ink-faint tracking-wide mb-1">Descent tempo</div>
-            <span className="text-[26px] font-medium text-ink tabular-nums leading-none">
-              {tempo > 0 ? tempo.toFixed(1) : "--"}
-              <span className="text-sm font-normal text-ink-soft ml-1">s</span>
+          <div
+            className="bg-white rounded-2xl p-5"
+            aria-label={`Descent tempo ${tempo > 0 ? tempo.toFixed(1) : "no data"} seconds, ${tempoLabel}`}
+          >
+            <div className="text-[12px] text-ink-faint font-medium uppercase tracking-wide mb-2">Descent tempo</div>
+            <span className="text-[28px] font-semibold text-ink tabular-nums leading-none tracking-tight">
+              {tempo > 0 ? tempo.toFixed(1) : "—"}
+              <span className="text-[14px] font-medium text-ink-faint ml-1">s</span>
             </span>
-            <div className="text-[11px] text-ink-faint mt-1">
-              Steady · within range
+            <div className="text-[13px] text-ink-soft mt-2 font-medium">
+              {tempoLabel}
             </div>
           </div>
+
+          {/* Setup hint */}
+          {state.setup_status && state.setup_status.severity !== "good" && (
+            <div className={`rounded-2xl p-4 text-[13px] font-medium flex items-center gap-2.5 ${
+              state.setup_status.severity === "blocking" || state.setup_status.severity === "warning"
+                ? "bg-warn-bg text-warn"
+                : "bg-surface text-ink-faint"
+            }`}>
+              <i className="ti ti-info-circle text-[16px]" />
+              {state.setup_status.hint}
+            </div>
+          )}
         </div>
 
-        {/* Sidebar — fusion (15%) */}
-        <div className="flex flex-col gap-3 min-h-0 overflow-y-auto">
+        {/* Sidebar — fusion indicators + actions */}
+        <div className="flex flex-col gap-3 min-h-0 overflow-y-auto
+                        max-[1023px]:flex-row max-[1023px]:flex-wrap max-[767px]:flex-row">
           <TrackingSource state={state} />
 
           {/* IMU quality */}
-          <div className="bg-white rounded-lg border border-hair p-4">
-            <div className="text-[10px] text-ink-faint tracking-wide mb-1">IMU quality</div>
-            <span className="text-lg font-medium text-ink tabular-nums">
+          <div className="bg-white rounded-2xl p-5" aria-label={`IMU quality ${Math.round(imuQ * 100)} percent`}>
+            <div className="text-[12px] text-ink-faint font-medium uppercase tracking-wide mb-2">IMU quality</div>
+            <span className={`text-[22px] font-semibold tabular-nums ${imuQ < 0.5 ? "text-warn" : "text-ink"}`}>
               {Math.round(imuQ * 100)}%
             </span>
           </div>
 
           {/* Visibility */}
-          <div className="bg-white rounded-lg border border-hair p-4">
-            <div className="text-[10px] text-ink-faint tracking-wide mb-1">Visibility</div>
-            <span className={`text-lg font-medium tabular-nums ${vis < 0.5 ? "text-warn" : "text-ink"}`}>
+          <div className="bg-white rounded-2xl p-5" aria-label={`Landmark visibility ${Math.round(vis * 100)} percent`}>
+            <div className="text-[12px] text-ink-faint font-medium uppercase tracking-wide mb-2">Visibility</div>
+            <span className={`text-[22px] font-semibold tabular-nums ${vis < 0.5 ? "text-warn" : "text-ink"}`}>
               {Math.round(vis * 100)}%
             </span>
+            {vis < 0.5 && (
+              <div className="flex items-center gap-1.5 mt-2 text-[12px] text-warn font-medium">
+                <i className="ti ti-alert-circle text-[14px]" />
+                Low visibility
+              </div>
+            )}
+          </div>
+
+          {/* End set — pinned to bottom */}
+          <div className="mt-auto">
+            <button
+              type="button"
+              onClick={() => setScreen("debrief")}
+              className="w-full flex items-center justify-center gap-2 min-h-[48px] px-4
+                         bg-surface/80 rounded-xl text-[14px] font-semibold text-ink-soft
+                         hover:bg-surface active:scale-[0.98]
+                         focus-visible:ring-2 focus-visible:ring-brand focus-visible:ring-offset-2
+                         transition-all duration-150 motion-reduce:transition-none motion-reduce:active:scale-100"
+            >
+              <i className="ti ti-player-stop text-[14px]" />
+              End set
+            </button>
           </div>
         </div>
       </div>
 
-      {/* Form-cue banner */}
-      {cue && (
-        <div className="shrink-0 bg-surface border-t border-hair px-5 py-2.5 flex items-center gap-2.5">
-          <i className="ti ti-volume text-ink-faint text-base" />
-          <span className="text-sm text-ink-soft">&ldquo;{cue}&rdquo;</span>
-        </div>
-      )}
+      {/* Form cue banner */}
+      <FormCueBanner state={state} />
     </div>
   )
 }
 
-/* ── Half-circle arc gauge ── */
+/* Half-circle arc gauge */
 function DepthArc({ angle, target, depthVariant }) {
   const A_MIN = 60
   const A_MAX = 180
@@ -164,12 +214,12 @@ function DepthArc({ angle, target, depthVariant }) {
       : "var(--color-ink-faint)"
 
   return (
-    <svg viewBox="0 0 140 80" className="w-full max-w-[180px] mx-auto">
-      <path d={arc(0, 1)} fill="none" stroke="var(--color-surface)" strokeWidth="8" strokeLinecap="round" />
+    <svg viewBox="0 0 140 80" className="w-full max-w-[180px] mx-auto" role="img" aria-hidden="true">
+      <path d={arc(0, 1)} fill="none" stroke="var(--color-surface)" strokeWidth="10" strokeLinecap="round" />
       {pct > 0.01 && (
-        <path d={arc(0, pct)} fill="none" stroke={fillColor} strokeWidth="8" strokeLinecap="round" />
+        <path d={arc(0, pct)} fill="none" stroke={fillColor} strokeWidth="10" strokeLinecap="round" />
       )}
-      <circle cx={tx} cy={ty} r="4" fill="var(--color-ok)" stroke="white" strokeWidth="2" />
+      <circle cx={tx} cy={ty} r="5" fill="var(--color-ok)" stroke="white" strokeWidth="2.5" />
     </svg>
   )
 }
