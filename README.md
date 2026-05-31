@@ -1,78 +1,63 @@
 # SteadyPT
 
-AI physical-therapy coach: webcam + thigh-mounted IMU track bodyweight squats, with
-sensor-fusion fallback when the camera loses sight of the thigh, an end-of-set Gemini
-debrief, and a live web dashboard.
+**AI physical-therapy coach.** A webcam + MediaPipe track your bodyweight squats in
+real time — counting reps, judging depth, and scoring each set 0–100 — then an
+end-of-set Gemini debrief explains how you did in a clinician's voice. A live web
+dashboard shows it all as you move, and a clinician handoff view summarizes the session.
 
-QuackHacks 3 (24h hackathon). Three-agent team.
+Built at QuackHacks 3 (24h hackathon).
 
-## First read
+## 🔗 Live demo
 
-- **[`CONTEXT.md`](CONTEXT.md)** — project brief + data contracts. Read first.
-- **[`HANDOFF_FRONTEND.md`](HANDOFF_FRONTEND.md)** — WebSocket / 4c / 4d contract reference
-  for the dashboard + Gemini wiring.
-- **[`HANDOFF_VOICE_IN.md`](HANDOFF_VOICE_IN.md)** — Web Speech API + "Hey coach"
-  + 4 commands brief for Agent C's voice input.
+**https://steadypt-713924675865.us-central1.run.app**
 
-## What's in the repo
+> The hosted link runs in **demo mode** (clearly banner-labeled): the cloud server has
+> no webcam, so it plays a *simulated* squat set through the full UI. To see real
+> camera tracking, run it locally (below) — it uses your machine's webcam.
 
-| File | Owner | Status |
-|---|---|---|
-| `pose_tracker.py` | Agent B | Done — pose tracking + fusion + rep state machine + 4c/4d + setup hints + profile-driven targets |
-| `profile.py` | Agent B | Done — `PTProfile` dataclass + Sam (post-ACL) default |
-| `ai_agent.py` | Agent B | Done — Gemini Flash wrappers (prescription parse + clinical debrief + session report) |
-| `bq.py` | Agent B | Done — BigQuery persistence (set + session writes, recent reads) |
-| `mock_state.py` | (shared) | Done — fake 4c stream + 4d summary including profile + ai_debrief |
-| `smoke.py` | Agent B | Done — backend assertions (counter, profile binding, setup classifier) |
-| `run.py` | Agent B | Done — standalone launcher (mac webcam pre-flight) |
-| `server.py` | Agent C | **Placeholder** — current file is a smoke server with upload + profile + ai_debrief broadcast wired. Agent C rewrites per CONTEXT.md §5 |
-| `static/index.html` | Agent C | **Placeholder** — minimal smoke UI. Agent C builds the real one |
-| `main.py` | (shared) | TODO — integration entry point. Wires Agent A's IMU + B's tracker + C's server |
-| `imu.py` | Agent A | TODO — real MPU6050 driver. `MockIMU` from `pose_tracker.py` is the stand-in |
+## How it works
 
-## Quick start
+1. **Pose tracking** — MediaPipe Pose gives 33 body landmarks per frame; we take the
+   hip–knee–ankle triple and compute the **knee angle** with vector math.
+2. **Rep counting** — a hysteresis state machine watches the angle cross down/up
+   thresholds (with debouncing) so jitter never counts phantom reps, and a depth gate
+   voids reps that don't go deep enough.
+3. **Scoring** — each set is scored 0–100 from four weighted parts: **depth** (40%) —
+   did you hit the prescribed angle — plus **consistency**, **tempo**, and
+   **completion** (20% each), rolled up to a letter grade.
+4. **AI debrief** — the per-set analysis is sent to Gemini for a short, clinical
+   spoken-style debrief; results persist to BigQuery for cross-session progress.
+
+## Run it locally (real camera tracking)
 
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
+.venv/bin/python run.py        # picks your webcam, starts the server
+# open http://localhost:8000
 ```
 
-### Google services (Gemini + BigQuery)
+Optional Google services (the app degrades gracefully without them):
+
+- `GEMINI_API_KEY` — AI prescription parsing + debriefs (falls back to a templated debrief)
+- Application Default Credentials — BigQuery persistence (falls back to in-memory)
+
+## Project layout
+
+| Path | What |
+|---|---|
+| `pose_tracker.py` | Pose tracking, rep state machine, per-set scoring + summary |
+| `server.py` | FastAPI app — WebSocket state broadcast, REST, serves the dashboard |
+| `ai_agent.py` | Gemini wrappers — prescription parse, clinical debrief, session report |
+| `bq.py` | BigQuery persistence (set + session writes, recent reads) |
+| `profile.py` / `exercise_spec.py` | PT profile + per-exercise rules (depth/tempo/reps) |
+| `frontend/` | React + Vite dashboard (built into `static/`) |
+| `demo_tracker.py` | Camera-less synthetic stream behind `PF_DEMO` (powers the hosted demo) |
+| `smoke.py` | Headless backend test suite (rep counter, scoring, setup classifier) |
+
+## Tests
 
 ```bash
-export GEMINI_API_KEY="AIza..."          # AI Studio key
-gcloud auth application-default login    # one-time, for BigQuery on the laptop
-export PF_BQ_DATASET="physiofusion"      # optional; this is the default
+.venv/bin/python smoke.py        # 133 assertions: counting, scoring, setup, fusion
+.venv/bin/python -m pytest tests/
 ```
-
-Both Gemini and BigQuery degrade gracefully without these — the demo runs
-either way. With them set, the AI debrief is spoken at set end, the
-prescription upload works, and every set is persisted to BigQuery.
-
-### No camera / no hardware (develop the dashboard)
-```bash
-.venv/bin/python mock_state.py    # prints a simulated set with an occlusion window
-```
-Or import in your code:
-```python
-from mock_state import state_stream, sample_set_summary
-```
-
-### Backend only, with webcam
-```bash
-.venv/bin/python run.py
-# open http://127.0.0.1:8000  (smoke dashboard; Agent C will replace)
-```
-On macOS the first run will pop a camera permission dialog — accept it.
-
-### Run the backend tests
-```bash
-.venv/bin/python smoke.py
-```
-
-## Demo beats (in priority order)
-
-1. Live tracking — skeleton overlay + ticking rep counter.
-2. **Occlusion handoff** — step out of frame, `tracking_source` flips to `imu`, depth gauge
-   keeps tracking. This is the entire justification for the hardware. Don't break this.
-3. Set-end Gemini debrief, spoken via ElevenLabs.

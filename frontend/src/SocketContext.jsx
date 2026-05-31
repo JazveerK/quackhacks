@@ -1,13 +1,5 @@
 import { createContext, useContext } from 'react'
 import useSocket from './hooks/useSocket'
-import useBrowserTracker from './hooks/useBrowserTracker'
-
-// Static/serverless deploys (Vercel, GitHub Pages) set VITE_CLIENT_TRACKING=1:
-// there is no backend, so tracking runs entirely in the visitor's browser
-// (their camera + MediaPipe). The hook reference is fixed at module load so the
-// same hook is called every render (Rules of Hooks safe).
-const CLIENT_TRACKING = import.meta.env.VITE_CLIENT_TRACKING === '1'
-const useTracker = CLIENT_TRACKING ? useBrowserTracker : useSocket
 
 /**
  * One shared live backend connection for the whole app.
@@ -27,7 +19,7 @@ const useTracker = CLIENT_TRACKING ? useBrowserTracker : useSocket
 const SocketContext = createContext(null)
 
 export function SocketProvider({ children }) {
-  const socket = useTracker()
+  const socket = useSocket()
   return <SocketContext.Provider value={socket}>{children}</SocketContext.Provider>
 }
 
